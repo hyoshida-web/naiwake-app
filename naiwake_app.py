@@ -1,0 +1,553 @@
+"""
+勘定科目内訳書作成ツール
+対象: 地代家賃 / 雑収入（医業外収益）
+入力: JDL元帳Excel（列位置で判定）
+  0列目: 年月日 / 1列目: 相手科目 / 2列目: 摘要 / 3列目: 借方 / 4列目: 貸方 / 5列目: 残高
+"""
+
+import io
+import re
+import unicodedata
+import difflib
+
+import streamlit as st
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+
+# ─────────────────────────────────────────────
+# 定数
+# ─────────────────────────────────────────────
+# JDL元帳の列インデックス（0始まり）
+COL_DESC   = 2  # 摘要（支払先＋内容、スペース2つ以上区切り）
+COL_DEBIT  = 3  # 借方
+COL_CREDIT = 4  # 貸方
+
+# 摘要列にこれらのキーワードを含む行は金額に関わらずスキップ
+SKIP_KEYWORDS = ["月計", "繰越", "消費税額振替", "決算", "当期計上分"]
+
+MODES = {
+    "地代家賃": {
+        "title": "地代家賃の内訳",
+        "amount_col_idx": COL_DEBIT,
+        "key_label": "支払先（貸主）名",
+        "amount_label": "支払金額",
+        "default_top_n": 0,       # 0 = 全件表示
+    },
+    "雑収入（医業外収益）": {
+        "title": "雑収入（医業外収益）の内訳",
+        "amount_col_idx": COL_CREDIT,
+        "key_label": "収入先名",
+        "amount_label": "収入金額",
+        "default_top_n": 15,      # 上位15件＋その他
+    },
+}
+
+SIMILARITY_THRESHOLD = 0.80  # 表記ゆれとみなす類似度の閾値
+CONTENT_COL = "取引内容"    # 摘要の2番目の部分（支払先ごとの代表内容）
+
+
+# ─────────────────────────────────────────────
+# 文字正規化
+# ─────────────────────────────────────────────
+def normalize_text(text):
+    if not text:
+        return text
+    # NFC正規化：Unicodeレベルで分離した濁点・半濁点を結合（最も確実な方法）
+    text = unicodedata.normalize('NFC', text)
+    # 上記で拾えない残余パターンを個別置換で補完
+    replacements = [
+        ('ハ\u309a', 'パ'), ('ヒ\u309a', 'ピ'), ('フ\u309a', 'プ'),
+        ('ヘ\u309a', 'ペ'), ('ホ\u309a', 'ポ'),
+        ('カ\u3099', 'ガ'), ('キ\u3099', 'ギ'), ('ク\u3099', 'グ'),
+        ('ケ\u3099', 'ゲ'), ('コ\u3099', 'ゴ'),
+        ('ハ\u3099', 'バ'), ('ヒ\u3099', 'ビ'), ('フ\u3099', 'ブ'),
+        ('ヘ\u3099', 'ベ'), ('ホ\u3099', 'ボ'),
+    ]
+    for src, dst in replacements:
+        text = text.replace(src, dst)
+    # 斎藤系異体字を統一
+    for v in ['斉', '斎']:
+        text = text.replace(v, '齋')
+    # 括弧付き注記を除去（例：齋藤直永（...）→ 齋藤直永）
+    text = re.sub(r'（[^）]*）', '', text).strip()
+    return text
+
+
+# ─────────────────────────────────────────────
+# ユーティリティ
+# ─────────────────────────────────────────────
+def find_similar_groups(names: list[str], threshold: float) -> dict[str, list[str]]:
+    """
+    difflib を使って名称の表記ゆれをグルーピングする。
+    戻り値: {代表名: [類似名リスト]} （類似名が1件のみのグループは除外）
+    """
+    remaining = list(names)
+    groups: dict[str, list[str]] = {}
+
+    while remaining:
+        base = remaining.pop(0)
+        similar = [base]
+        not_matched = []
+
+        for candidate in remaining:
+            ratio = difflib.SequenceMatcher(None, base, candidate).ratio()
+            if ratio >= threshold:
+                similar.append(candidate)
+            else:
+                not_matched.append(candidate)
+
+        if len(similar) > 1:
+            groups[base] = similar
+
+        remaining = not_matched
+
+    return groups
+
+
+def load_jdl_excel(
+    uploaded,
+    amount_col_idx: int,
+    key_label: str,
+    amount_label: str,
+    skiprows: int = 0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    JDL元帳Excelを列位置で読み込み、整形済みDataFrameと生データを返す。
+    - 全シートを読み込んで結合（複数月シート対応）
+    - 各シートのヘッダー行（1列目が「年月日」の行）を除去
+    - 摘要列（COL_DESC）をスペース2つ以上で分割し、先頭部分を支払先/収入先名とする
+    - 金額列は借方 or 貸方をモードに応じて選択
+    - 金額が0以下・空白の行は除外
+    """
+    # 全シートを読み込む（sheet_name=None で dict[シート名→DataFrame] を返す）
+    sheets = pd.read_excel(uploaded, header=None, skiprows=skiprows, dtype=str, sheet_name=None)
+    raw = pd.concat(sheets.values(), ignore_index=True)
+
+    if raw.shape[1] <= max(COL_DESC, amount_col_idx):
+        raise ValueError(
+            f"列数が不足しています（{raw.shape[1]}列）。"
+            f"最低でも {max(COL_DESC, amount_col_idx) + 1} 列必要です。"
+        )
+
+    # 各シートの列ヘッダー行を除去：1列目が「年月日」を含む行はヘッダーとみなしスキップ
+    header_mask = raw.iloc[:, 0].fillna("").astype(str).str.contains("年月日", na=False)
+    raw = raw[~header_mask].reset_index(drop=True)
+
+    desc_col = raw.iloc[:, COL_DESC].fillna("").astype(str).str.strip()
+
+    def extract_payee_and_content(desc: str) -> tuple[str, str]:
+        parts = re.split(r"\s{2,}", desc)
+        payee   = normalize_text(parts[0].strip()) if parts else ""
+        content = normalize_text(parts[1].strip()) if len(parts) > 1 else ""
+        # 「〇月分給与」など摘要に「給与」を含む行はすべて「寮費」に統合
+        if "給与" in desc:
+            return "寮費", "寮費"
+        return payee, content
+
+    extracted    = desc_col.apply(extract_payee_and_content)
+    payee_col    = extracted.apply(lambda x: x[0])
+    content_col  = extracted.apply(lambda x: x[1])
+    amount_col   = pd.to_numeric(raw.iloc[:, amount_col_idx], errors="coerce").fillna(0)
+
+    df = pd.DataFrame({
+        key_label:   payee_col,
+        CONTENT_COL: content_col,
+        amount_label: amount_col,
+        "_desc":     desc_col,
+    })
+
+    # スキップキーワードを含む行を除外（月計・繰越・消費税額振替・決算など）
+    # スペース除去後の文字列でマッチ → 「繰 越」「次 頁 へ 繰 越」などにも対応
+    desc_no_space = desc_col.str.replace(r"\s+", "", regex=True)
+    skip_pattern = "|".join(re.escape(kw) for kw in SKIP_KEYWORDS)
+    df = df[~desc_no_space.str.contains(skip_pattern, na=False)]
+
+    # 不要行の除外（金額0以下・支払先が空/nan文字列）
+    df = df[df[amount_label] > 0]
+    df = df[df[key_label].notna()]
+    df = df[~df[key_label].isin(["", "nan", "NaN"])]
+
+    df = df.drop(columns=["_desc"]).reset_index(drop=True)
+
+    return df, raw
+
+
+def auto_merge_by_frequency(
+    names: list[str],
+    counts: dict[str, int],
+    threshold: float = 0.75,
+) -> dict[str, str]:
+    """
+    類似度 threshold 以上のグループで、出現件数が最多の名称を正式名称として採用する。
+    戻り値: {旧名称: 正式名称}（正式名称自身のエントリは含まない）
+    """
+    # 件数の多い順に処理することで、先に処理された名称が正式名称になる
+    sorted_names = sorted(names, key=lambda n: counts.get(n, 0), reverse=True)
+    name_map: dict[str, str] = {}
+    assigned: set[str] = set()
+
+    for base in sorted_names:
+        if base in assigned:
+            continue
+        for candidate in sorted_names:
+            if candidate == base or candidate in assigned:
+                continue
+            # 一方が他方の前方一致の場合はマージしない
+            # 例：「千葉県」と「千葉県医務国保」は別物
+            if base.startswith(candidate) or candidate.startswith(base):
+                continue
+            ratio = difflib.SequenceMatcher(None, base, candidate).ratio()
+            if ratio >= threshold:
+                name_map[candidate] = base  # base が件数最多 → 正式名称
+                assigned.add(candidate)
+        assigned.add(base)
+
+    return name_map
+
+
+def collapse_to_top_n(df: pd.DataFrame, key_col: str, amount_col: str, top_n: int) -> pd.DataFrame:
+    """上位 top_n 件を残し、残りを「その他（N件）」1行にまとめる。top_n=0 は全件表示。"""
+    if top_n <= 0 or len(df) <= top_n:
+        return df
+    top = df.iloc[:top_n].copy()
+    other_count = len(df) - top_n
+    other_sum = df.iloc[top_n:][amount_col].sum()
+    # 全列を揃えるため df の列構成に合わせて other_row を生成
+    other_data = {col: [""] for col in df.columns}
+    other_data[key_col]    = [f"その他（{other_count}件）"]
+    other_data[amount_col] = [other_sum]
+    other_row = pd.DataFrame(other_data, index=[top_n + 1])
+    return pd.concat([top, other_row])
+
+
+def aggregate(df: pd.DataFrame, key_col: str, amount_col: str, name_map: dict[str, str]) -> pd.DataFrame:
+    """
+    name_map に従って名称を統一してから金額を集計する。
+    CONTENT_COL が存在する場合はグループ内の最頻値を代表内容として付加する。
+    """
+    df = df.copy()
+    df[key_col] = df[key_col].map(lambda x: name_map.get(x, x))
+
+    amount_result = (
+        df.groupby(key_col, as_index=False)[amount_col]
+        .sum()
+        .sort_values(amount_col, ascending=False)
+        .reset_index(drop=True)
+    )
+
+    if CONTENT_COL in df.columns:
+        def most_frequent(s):
+            vc = s[s != ""].value_counts()
+            return vc.index[0] if len(vc) > 0 else ""
+
+        content_result = df.groupby(key_col, as_index=False)[CONTENT_COL].agg(most_frequent)
+        result = amount_result.merge(content_result, on=key_col)
+        result = result[[key_col, CONTENT_COL, amount_col]]
+    else:
+        result = amount_result
+
+    result.index = range(1, len(result) + 1)
+    return result
+
+
+def to_excel_bytes(df: pd.DataFrame, title: str, amount_col: str) -> bytes:
+    """集計済み DataFrame を整形した Excel バイト列に変換する。列構成は df.columns に従う。"""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "内訳"
+
+    # ── スタイル定義 ──
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    title_font  = Font(bold=True, size=13)
+    total_font  = Font(bold=True, size=11)
+    border = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"),  bottom=Side(style="thin"),
+    )
+    center = Alignment(horizontal="center", vertical="center")
+    right  = Alignment(horizontal="right",  vertical="center")
+
+    cols = list(df.columns)
+
+    # ── タイトル行 ──
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(cols))
+    title_cell = ws.cell(row=1, column=1, value=title)
+    title_cell.font = title_font
+    title_cell.alignment = center
+
+    # ── ヘッダー行 ──
+    for c_idx, col_name in enumerate(cols, start=1):
+        cell = ws.cell(row=2, column=c_idx, value=col_name)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
+        cell.border = border
+
+    # ── データ行 ──
+    for r_idx, row in enumerate(df.itertuples(index=False), start=3):
+        for c_idx, (col_name, value) in enumerate(zip(cols, row), start=1):
+            cell = ws.cell(row=r_idx, column=c_idx, value=value)
+            cell.border = border
+            if col_name == amount_col:
+                cell.number_format = "#,##0"
+                cell.alignment = right
+            else:
+                cell.alignment = Alignment(vertical="center", wrap_text=True)
+
+    # ── 合計行 ──
+    total_row = len(df) + 3
+    amount_col_idx = cols.index(amount_col) + 1  # 1始まり
+    for c_idx, col_name in enumerate(cols, start=1):
+        cell = ws.cell(row=total_row, column=c_idx)
+        cell.border = border
+        cell.font = total_font
+        if c_idx == 1:
+            cell.value = "合　計"
+            cell.alignment = center
+        elif col_name == amount_col:
+            cell.value = df[amount_col].sum()
+            cell.number_format = "#,##0"
+            cell.alignment = right
+
+    # ── 列幅調整 ──
+    col_widths = {0: 32, 1: 22, 2: 16}  # 先頭から順に幅設定（3列想定、余剰は14）
+    for i in range(len(cols)):
+        ws.column_dimensions[get_column_letter(i + 1)].width = col_widths.get(i, 14)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────
+# Streamlit アプリ本体
+# ─────────────────────────────────────────────
+def main():
+    st.set_page_config(page_title="勘定科目内訳書作成ツール", page_icon="📋", layout="wide")
+    st.title("📋 勘定科目内訳書作成ツール")
+
+    # ── モード選択 ──
+    mode_label = st.radio(
+        "対象科目を選択してください",
+        list(MODES.keys()),
+        horizontal=True,
+    )
+    cfg = MODES[mode_label]
+    key_col        = cfg["key_label"]
+    amount_col     = cfg["amount_label"]
+    title          = cfg["title"]
+    amount_col_idx = cfg["amount_col_idx"]
+    default_top_n  = cfg["default_top_n"]
+
+    st.divider()
+
+    # ── ファイルアップロード ──
+    st.subheader("① Excelファイルのアップロード")
+
+    col_upload, col_skip = st.columns([4, 1])
+    with col_upload:
+        uploaded = st.file_uploader(
+            "JDL元帳 Excel ファイル（.xlsx / .xls）をアップロードしてください",
+            type=["xlsx", "xls"],
+            help="列順: 年月日 | 相手科目 | 摘要 | 借方 | 貸方 | 残高",
+        )
+    with col_skip:
+        skiprows = st.number_input(
+            "スキップ行数",
+            min_value=0,
+            max_value=20,
+            value=0,
+            step=1,
+            help="ファイル先頭のタイトル行など、データ前にある不要行の数を指定してください",
+        )
+
+    if uploaded is None:
+        st.info(
+            "JDL元帳Excelをアップロードすると処理を開始します。\n\n"
+            "**列構成（位置固定）**\n"
+            "1列目: 年月日 ／ 2列目: 相手科目 ／ 3列目: 摘要 ／ "
+            "4列目: 借方 ／ 5列目: 貸方 ／ 6列目: 残高\n\n"
+            f"**{mode_label}** は {'借方（4列目）' if amount_col_idx == COL_DEBIT else '貸方（5列目）'} を集計します。"
+        )
+        st.stop()
+
+    # ── データ読み込み ──
+    try:
+        raw_df, raw_all = load_jdl_excel(
+            uploaded, amount_col_idx, key_col, amount_col, skiprows=int(skiprows)
+        )
+    except Exception as e:
+        st.error(f"ファイルの読み込みに失敗しました: {e}")
+        st.stop()
+
+    if raw_df.empty:
+        st.warning(
+            "有効なデータが0件です。\n"
+            "・スキップ行数の設定を確認してください\n"
+            f"・{'借方' if amount_col_idx == COL_DEBIT else '貸方'}に金額が入力されている行があるか確認してください"
+        )
+        with st.expander("読み込んだ全データ（生）を確認する"):
+            st.dataframe(raw_all, use_container_width=True)
+        st.stop()
+
+    with st.expander("読み込んだ生データを確認する（抽出後）", expanded=False):
+        st.caption(f"摘要列をスペース2つ以上で分割し、先頭部分を「{key_col}」として抽出しました")
+        st.dataframe(raw_df, use_container_width=True)
+
+    st.divider()
+
+    # ── 自動統合（類似度0.75以上・件数多数決） ──
+    st.subheader("② 自動名称統合（類似度 0.75 以上）")
+
+    name_counts = raw_df[key_col].value_counts().to_dict()
+    auto_name_map = auto_merge_by_frequency(
+        list(raw_df[key_col].unique()), name_counts, threshold=0.75
+    )
+
+    # 自動統合を適用した作業用 DataFrame（以降の手動補正・集計はこちらを使う）
+    working_df = raw_df.copy()
+    working_df[key_col] = working_df[key_col].map(lambda x: auto_name_map.get(x, x))
+
+    if auto_name_map:
+        st.info(f"{len(auto_name_map)} 件の表記を自動統合しました（件数の多い表記を正式名称として採用）。")
+        auto_map_rows = [
+            {
+                "統合前の表記": old,
+                "統合後（正式名称）": new,
+                "統合前の件数": name_counts.get(old, 0),
+                "正式名称の件数": name_counts.get(new, 0),
+            }
+            for old, new in auto_name_map.items()
+        ]
+        with st.expander("自動統合の詳細を確認する", expanded=True):
+            st.dataframe(pd.DataFrame(auto_map_rows), use_container_width=True, hide_index=True)
+    else:
+        st.success("自動統合の対象となる類似名称はありませんでした。")
+
+    st.divider()
+
+    # ── 手動 表記ゆれ補正 ──
+    st.subheader("③ 手動 表記ゆれ補正（任意）")
+
+    threshold = st.slider(
+        "類似度のしきい値（低いほど広くマッチ）",
+        min_value=0.50,
+        max_value=1.00,
+        value=SIMILARITY_THRESHOLD,
+        step=0.01,
+        format="%.2f",
+    )
+
+    # 自動統合後の名称リストで表記ゆれを検索
+    unique_names = sorted(working_df[key_col].unique().tolist())
+    similar_groups = find_similar_groups(unique_names, threshold)
+
+    # セッションステートで名称マッピングを管理
+    if "name_map" not in st.session_state:
+        st.session_state.name_map = {}
+
+    if not similar_groups:
+        st.success("追加の表記ゆれは検出されませんでした。")
+    else:
+        st.warning(f"{len(similar_groups)} 件の表記ゆれグループを検出しました。統一後の名称を設定してください。")
+
+        for base_name, group in similar_groups.items():
+            with st.expander(f"グループ: **{base_name}** 他 {len(group) - 1} 件", expanded=True):
+                st.write("検出されたバリアント:", group)
+                unified = st.text_input(
+                    "統一後の名称",
+                    value=base_name,
+                    key=f"unified_{base_name}",
+                )
+                apply = st.checkbox("このグループを統合する", value=True, key=f"apply_{base_name}")
+                if apply:
+                    for name in group:
+                        st.session_state.name_map[name] = unified
+
+    # 手動マッピング追加
+    with st.expander("手動で名称を統一する（任意）", expanded=False):
+        st.write("個別に名称を変更できます。")
+        col1, col2, col3 = st.columns([3, 3, 1])
+        with col1:
+            src_name = st.selectbox("変更前の名称", [""] + unique_names, key="manual_src")
+        with col2:
+            dst_name = st.text_input("変更後の名称", key="manual_dst")
+        with col3:
+            st.write("")
+            st.write("")
+            if st.button("追加", use_container_width=True):
+                if src_name and dst_name:
+                    st.session_state.name_map[src_name] = dst_name
+                    st.success(f"「{src_name}」→「{dst_name}」を登録しました。")
+
+        if st.session_state.name_map:
+            st.write("現在の名称マッピング:")
+            map_df = pd.DataFrame(
+                list(st.session_state.name_map.items()),
+                columns=["変更前", "変更後"],
+            )
+            st.dataframe(map_df, use_container_width=True, hide_index=True)
+
+            if st.button("マッピングをリセット"):
+                st.session_state.name_map = {}
+                st.rerun()
+
+    st.divider()
+
+    # ── 集計 ──
+    st.subheader("④ 集計結果プレビュー")
+
+    col_topn, _ = st.columns([1, 3])
+    with col_topn:
+        top_n = st.number_input(
+            "上位N件で集計（0 = 全件表示）",
+            min_value=0,
+            max_value=500,
+            value=default_top_n,
+            step=1,
+            help="指定件数を超える分は「その他（N件）」1行にまとめます",
+        )
+
+    # 自動統合済み working_df に手動マッピングをさらに適用して集計
+    result_df = aggregate(working_df, key_col, amount_col, st.session_state.name_map)
+    total_all = result_df[amount_col].sum()
+    total_count = len(result_df)
+    result_df = collapse_to_top_n(result_df, key_col, amount_col, int(top_n))
+
+    # 表示列順：収入先名 | 取引内容（あれば） | 金額
+    display_cols = [c for c in [key_col, CONTENT_COL, amount_col] if c in result_df.columns]
+
+    col_left, col_right = st.columns([3, 1])
+    with col_left:
+        st.dataframe(
+            result_df[display_cols].style.format({amount_col: "{:,.0f}"}),
+            use_container_width=True,
+        )
+    with col_right:
+        st.metric("合計金額", f"¥{total_all:,.0f}")
+        st.metric("件数（集計前）", f"{total_count} 件")
+        if int(top_n) > 0 and total_count > int(top_n):
+            st.metric("表示件数", f"上位{int(top_n)}件＋その他")
+
+    st.divider()
+
+    # ── Excelダウンロード ──
+    st.subheader("⑤ Excelダウンロード")
+
+    excel_bytes = to_excel_bytes(result_df[display_cols], title, amount_col)
+
+    st.download_button(
+        label="📥 Excelをダウンロード",
+        data=excel_bytes,
+        file_name=f"{mode_label}_内訳書.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        type="primary",
+    )
+
+
+if __name__ == "__main__":
+    main()
