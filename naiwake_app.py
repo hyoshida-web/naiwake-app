@@ -313,20 +313,6 @@ def load_jdl_excel(
     return df, raw
 
 
-def _parse_month_from_date(date_str: str) -> int | None:
-    """
-    会計CSV日付文字列（例：60404=令和6年4月4日）から月を取得する。
-    日付文字列の末尾4文字が MMDD 形式のため、[-4:-2] を月として返す。
-    パース失敗時は None を返す。
-    """
-    s = date_str.strip()
-    if len(s) >= 4:
-        try:
-            return int(s[-4:-2])
-        except ValueError:
-            pass
-    return None
-
 
 def load_csv_file(
     uploaded,
@@ -358,7 +344,6 @@ def load_csv_file(
     col_amount_idx: int | None = None
     col_opposite_idx: int | None = None
     col_balance_idx: int | None = None
-    col_date_idx: int | None = None
     col_kaku_ku_idx: int | None = None
     col_zei_ku_idx: int | None = None
     ledger_total: float | None = None
@@ -374,8 +359,6 @@ def load_csv_file(
                 c = cell.strip()
                 if c == "摘要":
                     col_desc_idx = i
-                elif c == "日付":
-                    col_date_idx = i
                 elif c == amount_col_name:
                     col_amount_idx = i
                 elif c == opposite_col_name:
@@ -405,11 +388,6 @@ def load_csv_file(
 
         # データ行：1列目が CSV_ROW_MARKER で始まる行のみ収集
         if row and row[0].startswith(CSV_ROW_MARKER):
-            # 日付の月が 12 を超える行は決算仕訳としてスキップ
-            if col_date_idx is not None and col_date_idx < len(row):
-                month = _parse_month_from_date(row[col_date_idx])
-                if month is not None and month > 12:
-                    continue
             filtered_rows.append(row)
 
     # 生データ表示用 DataFrame（列数が異なる行が混在するため最大列数に合わせてパディング）
