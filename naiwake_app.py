@@ -1,8 +1,12 @@
 """
 勘定科目内訳書作成ツール
 対象: 地代家賃 / 雑収入（医業外収益）
-入力: JDL元帳Excel（列位置で判定）
-  0列目: 年月日 / 1列目: 相手科目 / 2列目: 摘要 / 3列目: 借方 / 4列目: 貸方 / 5列目: 残高
+入力:
+  [Excel] JDL元帳Excel（列位置で判定）
+    0列目: 年月日 / 1列目: 相手科目 / 2列目: 摘要 / 3列目: 借方 / 4列目: 貸方 / 5列目: 残高
+  [CSV] 会計CSV（Shift-JIS）
+    1列目が " #" で始まる行のみ処理
+    2列目: 日付 / 7列目: 摘要（全角スペース区切り） / 14列目: 借方 / 15列目: 貸方
 """
 
 import io
@@ -19,10 +23,17 @@ from openpyxl.utils import get_column_letter
 # ─────────────────────────────────────────────
 # 定数
 # ─────────────────────────────────────────────
-# JDL元帳の列インデックス（0始まり）
+# JDL元帳Excelの列インデックス（0始まり）
 COL_DESC   = 2  # 摘要（支払先＋内容、スペース2つ以上区切り）
 COL_DEBIT  = 3  # 借方
 COL_CREDIT = 4  # 貸方
+
+# 会計CSVの列インデックス（0始まり）
+CSV_COL_DATE   = 1   # 日付（例：60404 = 令和6年4月4日）
+CSV_COL_DESC   = 6   # 摘要（全角スペース区切り）
+CSV_COL_DEBIT  = 13  # 借方金額
+CSV_COL_CREDIT = 14  # 貸方金額
+CSV_ROW_MARKER = " #"  # 処理対象行の1列目プレフィックス
 
 # 摘要列にこれらのキーワードを含む行は金額に関わらずスキップ
 SKIP_KEYWORDS = ["月計", "繰越", "消費税額振替", "決算", "当期計上分"]
@@ -31,6 +42,7 @@ MODES = {
     "地代家賃": {
         "title": "地代家賃の内訳",
         "amount_col_idx": COL_DEBIT,
+        "csv_amount_col_idx": CSV_COL_DEBIT,
         "key_label": "支払先（貸主）名",
         "amount_label": "支払金額",
         "default_top_n": 0,       # 0 = 全件表示
@@ -38,6 +50,7 @@ MODES = {
     "雑収入（医業外収益）": {
         "title": "雑収入（医業外収益）の内訳",
         "amount_col_idx": COL_CREDIT,
+        "csv_amount_col_idx": CSV_COL_CREDIT,
         "key_label": "収入先名",
         "amount_label": "収入金額",
         "default_top_n": 15,      # 上位15件＋その他
@@ -51,6 +64,67 @@ CONTENT_COL = "取引内容"    # 摘要の2番目の部分（支払先ごとの
 # ─────────────────────────────────────────────
 # 文字正規化
 # ─────────────────────────────────────────────
+def hankaku_to_zenkaku(text: str) -> str:
+    """半角カナを全角カナに変換する（例：ﾚｵﾊﾟﾚｽ21→レオパレス21）"""
+    if not text:
+        return text
+
+    # 半角カナ→全角カナ 基本変換テーブル
+    HK_MAP = {
+        'ｦ': 'ヲ', 'ｧ': 'ァ', 'ｨ': 'ィ', 'ｩ': 'ゥ', 'ｪ': 'ェ', 'ｫ': 'ォ',
+        'ｬ': 'ャ', 'ｭ': 'ュ', 'ｮ': 'ョ', 'ｯ': 'ッ', 'ｰ': 'ー',
+        'ｱ': 'ア', 'ｲ': 'イ', 'ｳ': 'ウ', 'ｴ': 'エ', 'ｵ': 'オ',
+        'ｶ': 'カ', 'ｷ': 'キ', 'ｸ': 'ク', 'ｹ': 'ケ', 'ｺ': 'コ',
+        'ｻ': 'サ', 'ｼ': 'シ', 'ｽ': 'ス', 'ｾ': 'セ', 'ｿ': 'ソ',
+        'ﾀ': 'タ', 'ﾁ': 'チ', 'ﾂ': 'ツ', 'ﾃ': 'テ', 'ﾄ': 'ト',
+        'ﾅ': 'ナ', 'ﾆ': 'ニ', 'ﾇ': 'ヌ', 'ﾈ': 'ネ', 'ﾉ': 'ノ',
+        'ﾊ': 'ハ', 'ﾋ': 'ヒ', 'ﾌ': 'フ', 'ﾍ': 'ヘ', 'ﾎ': 'ホ',
+        'ﾏ': 'マ', 'ﾐ': 'ミ', 'ﾑ': 'ム', 'ﾒ': 'メ', 'ﾓ': 'モ',
+        'ﾔ': 'ヤ', 'ﾕ': 'ユ', 'ﾖ': 'ヨ',
+        'ﾗ': 'ラ', 'ﾘ': 'リ', 'ﾙ': 'ル', 'ﾚ': 'レ', 'ﾛ': 'ロ',
+        'ﾜ': 'ワ', 'ﾝ': 'ン',
+        '｡': '。', '｢': '「', '｣': '」', '､': '、', '･': '・',
+    }
+    DAKUTEN    = 'ﾞ'  # U+FF9E
+    HANDAKUTEN = 'ﾟ'  # U+FF9F
+
+    # 濁点付き変換テーブル
+    DAKUTEN_MAP = {
+        'カ': 'ガ', 'キ': 'ギ', 'ク': 'グ', 'ケ': 'ゲ', 'コ': 'ゴ',
+        'サ': 'ザ', 'シ': 'ジ', 'ス': 'ズ', 'セ': 'ゼ', 'ソ': 'ゾ',
+        'タ': 'ダ', 'チ': 'ヂ', 'ツ': 'ヅ', 'テ': 'デ', 'ト': 'ド',
+        'ハ': 'バ', 'ヒ': 'ビ', 'フ': 'ブ', 'ヘ': 'ベ', 'ホ': 'ボ',
+        'ウ': 'ヴ',
+    }
+    # 半濁点付き変換テーブル
+    HANDAKUTEN_MAP = {
+        'ハ': 'パ', 'ヒ': 'ピ', 'フ': 'プ', 'ヘ': 'ペ', 'ホ': 'ポ',
+    }
+
+    result = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch in HK_MAP:
+            zk = HK_MAP[ch]
+            if i + 1 < len(text):
+                next_ch = text[i + 1]
+                if next_ch == DAKUTEN and zk in DAKUTEN_MAP:
+                    result.append(DAKUTEN_MAP[zk])
+                    i += 2
+                    continue
+                elif next_ch == HANDAKUTEN and zk in HANDAKUTEN_MAP:
+                    result.append(HANDAKUTEN_MAP[zk])
+                    i += 2
+                    continue
+            result.append(zk)
+        else:
+            result.append(ch)
+        i += 1
+
+    return ''.join(result)
+
+
 def normalize_text(text):
     if not text:
         return text
@@ -172,6 +246,80 @@ def load_jdl_excel(
     df = df.drop(columns=["_desc"]).reset_index(drop=True)
 
     return df, raw
+
+
+def load_csv_file(
+    uploaded,
+    amount_col_idx: int,
+    key_label: str,
+    amount_label: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    会計CSVファイル（Shift-JIS）を読み込み、整形済みDataFrameと生データを返す。
+    - 1列目が " #" で始まる行のみ処理
+    - 摘要列（CSV_COL_DESC）を全角スペース（\\u3000）で分割
+    - 半角カナを全角カナに変換してから処理
+    """
+    content = uploaded.read()
+    raw = pd.read_csv(
+        io.BytesIO(content),
+        encoding='shift_jis',
+        header=None,
+        dtype=str,
+    )
+
+    # 1列目が CSV_ROW_MARKER で始まる行のみ処理
+    mask = raw.iloc[:, 0].fillna("").astype(str).str.startswith(CSV_ROW_MARKER)
+    filtered = raw[mask].reset_index(drop=True)
+
+    if filtered.empty:
+        return pd.DataFrame(), raw
+
+    if filtered.shape[1] <= max(CSV_COL_DESC, amount_col_idx):
+        raise ValueError(
+            f"列数が不足しています（{filtered.shape[1]}列）。"
+            f"最低でも {max(CSV_COL_DESC, amount_col_idx) + 1} 列必要です。"
+        )
+
+    # 摘要列を取得し、半角カナを全角カナに変換
+    desc_col = filtered.iloc[:, CSV_COL_DESC].fillna("").astype(str).str.strip()
+    desc_col = desc_col.apply(hankaku_to_zenkaku)
+
+    def extract_payee_and_content(desc: str) -> tuple[str, str]:
+        # 全角スペース（\u3000）で分割
+        parts = desc.split('\u3000')
+        payee   = normalize_text(parts[0].strip()) if parts else ""
+        content = normalize_text(parts[1].strip()) if len(parts) > 1 else ""
+        # 「〇月分給与」など摘要に「給与」を含む行はすべて「寮費」に統合
+        if "給与" in desc:
+            return "寮費", "寮費"
+        return payee, content
+
+    extracted   = desc_col.apply(extract_payee_and_content)
+    payee_col   = extracted.apply(lambda x: x[0])
+    content_col = extracted.apply(lambda x: x[1])
+    amount_col  = pd.to_numeric(filtered.iloc[:, amount_col_idx], errors="coerce").fillna(0)
+
+    df = pd.DataFrame({
+        key_label:    payee_col,
+        CONTENT_COL:  content_col,
+        amount_label: amount_col,
+        "_desc":      desc_col,
+    })
+
+    # スキップキーワードを含む行を除外
+    desc_no_space = desc_col.str.replace(r"\s+", "", regex=True)
+    skip_pattern = "|".join(re.escape(kw) for kw in SKIP_KEYWORDS)
+    df = df[~desc_no_space.str.contains(skip_pattern, na=False)]
+
+    # 不要行の除外（金額0以下・支払先が空/nan文字列）
+    df = df[df[amount_label] > 0]
+    df = df[df[key_label].notna()]
+    df = df[~df[key_label].isin(["", "nan", "NaN"])]
+
+    df = df.drop(columns=["_desc"]).reset_index(drop=True)
+
+    return df, filtered
 
 
 def auto_merge_by_frequency(
@@ -340,45 +488,58 @@ def main():
     amount_col     = cfg["amount_label"]
     title          = cfg["title"]
     amount_col_idx = cfg["amount_col_idx"]
+    csv_amount_col_idx = cfg["csv_amount_col_idx"]
     default_top_n  = cfg["default_top_n"]
 
     st.divider()
 
     # ── ファイルアップロード ──
-    st.subheader("① Excelファイルのアップロード")
+    st.subheader("① ファイルのアップロード")
 
     col_upload, col_skip = st.columns([4, 1])
     with col_upload:
         uploaded = st.file_uploader(
-            "JDL元帳 Excel ファイル（.xlsx / .xls）をアップロードしてください",
-            type=["xlsx", "xls"],
-            help="列順: 年月日 | 相手科目 | 摘要 | 借方 | 貸方 | 残高",
+            "JDL元帳ファイル（.xlsx / .xls / .csv）をアップロードしてください",
+            type=["xlsx", "xls", "csv"],
+            help=(
+                "Excel: 列順 = 年月日 | 相手科目 | 摘要 | 借方 | 貸方 | 残高\n"
+                "CSV(Shift-JIS): 1列目が「 #」の行のみ処理、7列目=摘要、14列目=借方、15列目=貸方"
+            ),
         )
     with col_skip:
         skiprows = st.number_input(
-            "スキップ行数",
+            "スキップ行数（Excelのみ）",
             min_value=0,
             max_value=20,
             value=0,
             step=1,
-            help="ファイル先頭のタイトル行など、データ前にある不要行の数を指定してください",
+            help="Excelファイルの先頭にある不要行の数を指定してください（CSVは無視されます）",
         )
 
     if uploaded is None:
         st.info(
-            "JDL元帳Excelをアップロードすると処理を開始します。\n\n"
-            "**列構成（位置固定）**\n"
+            "JDL元帳ファイル（Excel または CSV）をアップロードすると処理を開始します。\n\n"
+            "**Excel の列構成（位置固定）**\n"
             "1列目: 年月日 ／ 2列目: 相手科目 ／ 3列目: 摘要 ／ "
             "4列目: 借方 ／ 5列目: 貸方 ／ 6列目: 残高\n\n"
-            f"**{mode_label}** は {'借方（4列目）' if amount_col_idx == COL_DEBIT else '貸方（5列目）'} を集計します。"
+            "**CSV の仕様（Shift-JIS）**\n"
+            "1列目が「 #」で始まる行のみ処理 ／ 7列目: 摘要（全角スペース区切り） ／ "
+            "14列目: 借方 ／ 15列目: 貸方\n\n"
+            f"**{mode_label}** は {'借方' if amount_col_idx == COL_DEBIT else '貸方'} を集計します。"
         )
         st.stop()
 
     # ── データ読み込み ──
+    is_csv = uploaded.name.lower().endswith(".csv")
     try:
-        raw_df, raw_all = load_jdl_excel(
-            uploaded, amount_col_idx, key_col, amount_col, skiprows=int(skiprows)
-        )
+        if is_csv:
+            raw_df, raw_all = load_csv_file(
+                uploaded, csv_amount_col_idx, key_col, amount_col
+            )
+        else:
+            raw_df, raw_all = load_jdl_excel(
+                uploaded, amount_col_idx, key_col, amount_col, skiprows=int(skiprows)
+            )
     except Exception as e:
         st.error(f"ファイルの読み込みに失敗しました: {e}")
         st.stop()
@@ -386,15 +547,17 @@ def main():
     if raw_df.empty:
         st.warning(
             "有効なデータが0件です。\n"
-            "・スキップ行数の設定を確認してください\n"
-            f"・{'借方' if amount_col_idx == COL_DEBIT else '貸方'}に金額が入力されている行があるか確認してください"
+            + ("・1列目が「 #」で始まる行が存在するか確認してください\n" if is_csv else
+               "・スキップ行数の設定を確認してください\n")
+            + f"・{'借方' if (csv_amount_col_idx if is_csv else amount_col_idx) == (CSV_COL_DEBIT if is_csv else COL_DEBIT) else '貸方'}に金額が入力されている行があるか確認してください"
         )
         with st.expander("読み込んだ全データ（生）を確認する"):
             st.dataframe(raw_all, use_container_width=True)
         st.stop()
 
     with st.expander("読み込んだ生データを確認する（抽出後）", expanded=False):
-        st.caption(f"摘要列をスペース2つ以上で分割し、先頭部分を「{key_col}」として抽出しました")
+        sep_desc = "全角スペース（\u3000）" if is_csv else "スペース2つ以上"
+        st.caption(f"摘要列を{sep_desc}で分割し、先頭部分を「{key_col}」として抽出しました")
         st.dataframe(raw_df, use_container_width=True)
 
     st.divider()
