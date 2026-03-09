@@ -33,8 +33,7 @@ COL_CREDIT = 4  # 貸方
 CSV_ROW_MARKER = " #"  # 処理対象行の1列目プレフィックス（会計CSV）
 
 # 摘要列にこれらのキーワードを含む行は金額に関わらずスキップ
-# ※「当期計上分」は主列（借方/貸方）に計上されるため通常行として処理する
-SKIP_KEYWORDS = ["月計", "繰越", "消費税額振替", "決算"]
+SKIP_KEYWORDS = ["消費税額振替", "月計", "決算月計", "繰越", "期首残高"]
 
 MODES = {
     "地代家賃": {
@@ -336,18 +335,18 @@ def load_csv_file(
     key_label: str,
     amount_label: str,
     taxable_kaku_codes: set[str],
-) -> tuple[pd.DataFrame, pd.DataFrame, float | None, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, float | None]:
     """
-    会計CSVファイル（Shift-JIS）を読み込み、整形済みDataFrame・生データ・元帳合計を返す。
-    - 列数がバラバラな行が混在するため csv モジュールで1行ずつ読み込む
-    - 「借方金額」「貸方金額」「摘要」「日付」「課区」「税区」「残高」を含むヘッダー行から
-      列インデックスを動的に特定する
-    - 1列目が CSV_ROW_MARKER（" #"）で始まる行のみ処理し、それ以外はすべてスキップ
-    - 日付の月部分が 12 を超える行（決算仕訳）は除外する
-    - 「元帳終了」行の直前の残高値を元帳合計として取得し第3戻り値として返す
-    - 課区・税区に基づき税抜き金額に変換してから処理する
-    - 純額 = 主列 − 逆列（返金・前期計上分戻入などを自動でマイナス計上）
-    - 摘要列を全角スペース（\u3000）で分割し、半角カナを全角カナに変換してから処理
+    会計CSVファイル（Shift-JIS）を読み込み、整形済みDataFrame・生データ・元帳残高を返す。
+
+    集計ロジック（1列目が CSV_ROW_MARKER の行を対象）：
+    ・スキップ行（SKIP_KEYWORDS に該当）→ 除外
+    ・前期計上分戻入 → 逆列金額をマイナスとして計上
+    ・当期計上分     → 主列金額をプラスとして計上
+    ・通常行         → 主列 − 逆列 の純額を計上
+    ・いずれも税抜き計算を適用する
+
+    元帳残高：「元帳終了」行の直前に出現した残高列の最終値を使用する。
     """
     content = uploaded.read()
     text = content.decode('shift_jis', errors='replace')
@@ -421,7 +420,7 @@ def load_csv_file(
     )
 
     if not filtered_rows:
-        return pd.DataFrame(), raw, ledger_total, pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), raw, ledger_total
 
     if col_desc_idx is None:
         raise ValueError(
@@ -432,94 +431,70 @@ def load_csv_file(
             f"ヘッダー行に「{amount_col_name}」列が見つかりませんでした。"
         )
 
-    # データ行を DataFrame 化（課区・税区を含む必要列数に満たない行は空文字でパディング）
-    needed_idxs = [col_desc_idx, col_amount_idx]
-    if col_opposite_idx is not None:
-        needed_idxs.append(col_opposite_idx)
-    if col_kaku_ku_idx is not None:
-        needed_idxs.append(col_kaku_ku_idx)
-    if col_zei_ku_idx is not None:
-        needed_idxs.append(col_zei_ku_idx)
-    required_cols = max(needed_idxs) + 1
-    padded_rows = [r + [""] * max(0, required_cols - len(r)) for r in filtered_rows]
-    filtered = pd.DataFrame(padded_rows, dtype=str)
+    # ── ヘルパー：列インデックス指定でセルを float に変換 ──
+    def _cell_float(row: list[str], idx: int | None) -> float:
+        if idx is None or idx >= len(row):
+            return 0.0
+        val = row[idx].replace(",", "").strip()
+        try:
+            return float(val) if val else 0.0
+        except ValueError:
+            return 0.0
 
-    # 摘要列を取得し、半角カナを全角カナに変換
-    desc_col = filtered.iloc[:, col_desc_idx].fillna("").astype(str).str.strip()
-    desc_col = desc_col.apply(hankaku_to_zenkaku)
-
-    def extract_payee_and_content(desc: str) -> tuple[str, str]:
-        # 全角スペース（\u3000）で分割
-        parts = desc.split('\u3000')
-        payee   = normalize_text(parts[0].strip()) if parts else ""
-        content = normalize_text(parts[1].strip()) if len(parts) > 1 else ""
-        # 「〇月分給与」など摘要に「給与」を含む行はすべて「寮費」に統合
-        if "給与" in desc:
-            return "寮費", "寮費"
-        return payee, content
-
-    extracted   = desc_col.apply(extract_payee_and_content)
-    payee_col   = extracted.apply(lambda x: x[0])
-    content_col = extracted.apply(lambda x: x[1])
-
-    # 課区・税区列が検出できた場合は税抜き計算を適用する（主列・逆列ともに）
-    raw_amounts = pd.to_numeric(filtered.iloc[:, col_amount_idx], errors="coerce").fillna(0)
-    raw_opp_amounts = (
-        pd.to_numeric(filtered.iloc[:, col_opposite_idx], errors="coerce").fillna(0)
-        if col_opposite_idx is not None
-        else pd.Series(0.0, index=raw_amounts.index)
-    )
-    if col_kaku_ku_idx is not None and col_zei_ku_idx is not None:
-        kaku_ku_col = filtered.iloc[:, col_kaku_ku_idx].fillna("").astype(str).str.strip()
-        zei_ku_col  = filtered.iloc[:, col_zei_ku_idx].fillna("").astype(str).str.strip()
-        amount_col_data = pd.Series(
-            [calc_tax_excluded(a, k, z, taxable_kaku_codes)
-             for a, k, z in zip(raw_amounts, kaku_ku_col, zei_ku_col)],
-            index=raw_amounts.index,
-        )
-        opp_col_data = pd.Series(
-            [calc_tax_excluded(a, k, z, taxable_kaku_codes)
-             for a, k, z in zip(raw_opp_amounts, kaku_ku_col, zei_ku_col)],
-            index=raw_opp_amounts.index,
-        )
-    else:
-        amount_col_data = raw_amounts
-        opp_col_data = raw_opp_amounts
-
-    # 純額 = 主列 − 逆列（返金・前期計上分戻入などを自動でマイナス計上）
-    net_amounts = amount_col_data - opp_col_data
-
-    df = pd.DataFrame({
-        key_label:    payee_col,
-        CONTENT_COL:  content_col,
-        amount_label: net_amounts,
-        "_desc":      desc_col,
-    })
-
-    # スキップキーワードを含む行を除外（摘要ベース：月計・繰越・消費税額振替・決算など）
-    desc_no_space = desc_col.str.replace(r"\s+", "", regex=True)
+    # ── 1行ずつ処理して records に蓄積 ──
     skip_pattern = "|".join(re.escape(kw) for kw in SKIP_KEYWORDS)
-    skip_mask = desc_no_space.str.contains(skip_pattern, na=False)
+    records: list[dict] = []
 
-    # 誤スキップ候補：SKIP_KEYWORDS に該当するが純額がある行（自動修正で再投入）
-    misskipped_df = (
-        df[skip_mask & (df[amount_label] != 0)]
-        .drop(columns=["_desc"])
-        .reset_index(drop=True)
+    for row in filtered_rows:
+        # 摘要（半角カナ→全角カナ変換済み、スペース除去版も用意）
+        desc_raw = row[col_desc_idx] if col_desc_idx < len(row) else ""
+        desc = hankaku_to_zenkaku(desc_raw.strip())
+        desc_ns = re.sub(r"\s+", "", desc)  # スペース除去版（キーワードマッチ用）
+
+        # スキップ判定
+        if re.search(skip_pattern, desc_ns):
+            continue
+
+        # 課区・税区
+        kaku = row[col_kaku_ku_idx].strip() if col_kaku_ku_idx is not None and col_kaku_ku_idx < len(row) else ""
+        zei  = row[col_zei_ku_idx].strip()  if col_zei_ku_idx  is not None and col_zei_ku_idx  < len(row) else ""
+
+        # 主列・逆列の税抜き金額
+        main_amount = calc_tax_excluded(_cell_float(row, col_amount_idx),   kaku, zei, taxable_kaku_codes)
+        opp_amount  = calc_tax_excluded(_cell_float(row, col_opposite_idx), kaku, zei, taxable_kaku_codes)
+
+        # 金額区分
+        if "前期計上分戻入" in desc_ns:
+            net = -opp_amount           # 逆列をマイナスで計上
+        elif "当期計上分" in desc_ns:
+            net = main_amount           # 主列をプラスで計上
+        else:
+            net = main_amount - opp_amount  # 通常行：純額
+
+        if net == 0:
+            continue
+
+        # 支払先・取引内容を摘要から抽出（全角スペース区切り）
+        parts = desc.split('\u3000')
+        if "給与" in desc:
+            payee, content = "寮費", "寮費"
+        else:
+            payee   = normalize_text(parts[0].strip()) if parts else ""
+            content = normalize_text(parts[1].strip()) if len(parts) > 1 else ""
+
+        if not payee or payee in ("nan", "NaN"):
+            continue
+
+        records.append({key_label: payee, CONTENT_COL: content, amount_label: net})
+
+    df = (
+        pd.DataFrame(records)
+        if records
+        else pd.DataFrame(columns=[key_label, CONTENT_COL, amount_label])
     )
+    df = df.reset_index(drop=True)
 
-    # 訂正仕訳候補：純額計算により自動的にマイナス計上されるため不要
-    correction_df = pd.DataFrame()
-
-    # 本体フィルタ：スキップ対象外・純額0以外・有効な支払先のみ
-    df = df[~skip_mask]
-    df = df[df[amount_label] != 0]
-    df = df[df[key_label].notna()]
-    df = df[~df[key_label].isin(["", "nan", "NaN"])]
-
-    df = df.drop(columns=["_desc"]).reset_index(drop=True)
-
-    return df, filtered, ledger_total, misskipped_df, correction_df
+    return df, raw, ledger_total
 
 
 def auto_merge_by_frequency(
@@ -734,11 +709,9 @@ def main():
     # ── データ読み込み ──
     is_csv = uploaded.name.lower().endswith(".csv")
     ledger_total: float | None = None
-    misskipped_df: pd.DataFrame = pd.DataFrame()
-    correction_df: pd.DataFrame = pd.DataFrame()
     try:
         if is_csv:
-            raw_df, raw_all, ledger_total, misskipped_df, correction_df = load_csv_file(
+            raw_df, raw_all, ledger_total = load_csv_file(
                 uploaded, csv_amount_col_name, csv_opposite_col_name,
                 key_col, amount_col, taxable_kaku_codes
             )
@@ -886,24 +859,8 @@ def main():
     result_df = aggregate(working_df, key_col, amount_col, st.session_state.name_map)
     total_all = result_df[amount_col].sum()
 
-    # ── 残高チェック & 自動修正（CSVのみ） ──
+    # ── 残高チェック（CSVのみ） ──
     if is_csv and ledger_total is not None:
-        if abs(total_all - ledger_total) >= 1:
-            # 差額あり → 誤スキップ行・訂正仕訳行を追加して自動修正を試みる
-            fix_parts: list[pd.DataFrame] = [working_df]
-            if not misskipped_df.empty:
-                m = misskipped_df.copy()
-                m[key_col] = m[key_col].map(lambda x: auto_name_map.get(x, x))
-                fix_parts.append(m)
-            if not correction_df.empty:
-                c = correction_df.copy()
-                c[key_col] = c[key_col].map(lambda x: auto_name_map.get(x, x))
-                fix_parts.append(c)
-            if len(fix_parts) > 1:
-                working_df_fixed = pd.concat(fix_parts, ignore_index=True)
-                result_df = aggregate(working_df_fixed, key_col, amount_col, st.session_state.name_map)
-                total_all = result_df[amount_col].sum()
-
         diff = total_all - ledger_total
         if abs(diff) <= 1000:
             st.success(f"✅ 元帳とほぼ一致しています（誤差：{diff:+,.0f}円）")
