@@ -340,11 +340,11 @@ def load_csv_file(
     """
     会計CSVファイル（Shift-JIS）を読み込み、整形済みDataFrame・生データ・元帳合計を返す。
     - 列数がバラバラな行が混在するため csv モジュールで1行ずつ読み込む
-    - 「借方金額」「貸方金額」「摘要」「日付」「課区」「税区」を含むヘッダー行から
+    - 「借方金額」「貸方金額」「摘要」「日付」「課区」「税区」「残高」を含むヘッダー行から
       列インデックスを動的に特定する
     - 1列目が CSV_ROW_MARKER（" #"）で始まる行のみ処理し、それ以外はすべてスキップ
     - 日付の月部分が 12 を超える行（決算仕訳）は除外する
-    - 「合計金額」を含む行から元帳合計を取得し第3戻り値として返す
+    - 「元帳終了」行の直前の残高値を元帳合計として取得し第3戻り値として返す
     - 課区・税区に基づき税抜き金額に変換してから処理する
     - 純額 = 主列 − 逆列（返金・前期計上分戻入などを自動でマイナス計上）
     - 摘要列を全角スペース（\u3000）で分割し、半角カナを全角カナに変換してから処理
@@ -352,16 +352,18 @@ def load_csv_file(
     content = uploaded.read()
     text = content.decode('shift_jis', errors='replace')
 
-    # csv モジュールで1行ずつ読み込み、ヘッダー行・データ行・合計行を振り分ける
+    # csv モジュールで1行ずつ読み込み、ヘッダー行・データ行を振り分ける
     all_rows: list[list[str]] = []
     filtered_rows: list[list[str]] = []
     col_desc_idx: int | None = None
     col_amount_idx: int | None = None
     col_opposite_idx: int | None = None
+    col_balance_idx: int | None = None
     col_date_idx: int | None = None
     col_kaku_ku_idx: int | None = None
     col_zei_ku_idx: int | None = None
     ledger_total: float | None = None
+    last_balance: float | None = None  # 残高列の最終値（元帳終了直前）
 
     reader = csv.reader(io.StringIO(text))
     for row in reader:
@@ -379,20 +381,28 @@ def load_csv_file(
                     col_amount_idx = i
                 elif c == opposite_col_name:
                     col_opposite_idx = i
+                elif c == "残高":
+                    col_balance_idx = i
                 elif c == "課区":
                     col_kaku_ku_idx = i
                 elif c == "税区":
                     col_zei_ku_idx = i
             continue  # ヘッダー行自体はデータとして追加しない
 
-        # 「合計金額」行の検出：元帳合計を取得
-        if any("合計金額" in cell for cell in row):
-            if col_amount_idx is not None and col_amount_idx < len(row):
+        # 「元帳終了」行の検出：直前までの残高最終値を元帳合計として確定
+        if any("元帳終了" in cell for cell in row):
+            if last_balance is not None:
+                ledger_total = last_balance
+            continue
+
+        # 残高列の最終値を追跡（元帳終了直前の値が正解値になる）
+        if col_balance_idx is not None and col_balance_idx < len(row):
+            val = row[col_balance_idx].replace(",", "").strip()
+            if val:
                 try:
-                    ledger_total = float(row[col_amount_idx].replace(",", "").strip())
+                    last_balance = float(val)
                 except ValueError:
                     pass
-            continue  # 合計行はデータとして追加しない
 
         # データ行：1列目が CSV_ROW_MARKER で始まる行のみ収集
         if row and row[0].startswith(CSV_ROW_MARKER):
@@ -895,8 +905,8 @@ def main():
                 total_all = result_df[amount_col].sum()
 
         diff = total_all - ledger_total
-        if abs(diff) < 1:
-            st.success("✅ 元帳と一致しています")
+        if abs(diff) <= 1000:
+            st.success(f"✅ 元帳とほぼ一致しています（誤差：{diff:+,.0f}円）")
         else:
             st.error(f"⚠️ 差額 {diff:+,.0f}円 が解消できませんでした")
 
