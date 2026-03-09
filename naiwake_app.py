@@ -327,7 +327,7 @@ def load_csv_file(
     )
 
     if not filtered_rows:
-        return pd.DataFrame(), raw, ledger_total
+        return pd.DataFrame(), raw, ledger_total, pd.DataFrame(), pd.DataFrame()
 
     if col_desc_idx is None:
         raise ValueError(
@@ -372,16 +372,32 @@ def load_csv_file(
     # スキップキーワードを含む行を除外（摘要ベース：月計・繰越・消費税額振替・決算など）
     desc_no_space = desc_col.str.replace(r"\s+", "", regex=True)
     skip_pattern = "|".join(re.escape(kw) for kw in SKIP_KEYWORDS)
-    df = df[~desc_no_space.str.contains(skip_pattern, na=False)]
+    skip_mask = desc_no_space.str.contains(skip_pattern, na=False)
 
-    # 不要行の除外（金額0以下・支払先が空/nan文字列）
+    # 誤スキップ候補：SKIP_KEYWORDS に該当するが対象金額がある行（自動修正で再投入）
+    misskipped_df = (
+        df[skip_mask & (df[amount_label] > 0)]
+        .drop(columns=["_desc"])
+        .reset_index(drop=True)
+    )
+
+    # 訂正仕訳候補：SKIP_KEYWORDS 非該当でマイナス金額・有効支払先の行（自動修正で差し引き）
+    valid_payee_mask = df[key_label].notna() & ~df[key_label].isin(["", "nan", "NaN"])
+    correction_df = (
+        df[~skip_mask & (df[amount_label] < 0) & valid_payee_mask]
+        .drop(columns=["_desc"])
+        .reset_index(drop=True)
+    )
+
+    # 本体フィルタ：スキップ対象外・金額正・有効な支払先のみ
+    df = df[~skip_mask]
     df = df[df[amount_label] > 0]
     df = df[df[key_label].notna()]
     df = df[~df[key_label].isin(["", "nan", "NaN"])]
 
     df = df.drop(columns=["_desc"]).reset_index(drop=True)
 
-    return df, filtered, ledger_total
+    return df, filtered, ledger_total, misskipped_df, correction_df
 
 
 def auto_merge_by_frequency(
@@ -593,9 +609,11 @@ def main():
     # ── データ読み込み ──
     is_csv = uploaded.name.lower().endswith(".csv")
     ledger_total: float | None = None
+    misskipped_df: pd.DataFrame = pd.DataFrame()
+    correction_df: pd.DataFrame = pd.DataFrame()
     try:
         if is_csv:
-            raw_df, raw_all, ledger_total = load_csv_file(
+            raw_df, raw_all, ledger_total, misskipped_df, correction_df = load_csv_file(
                 uploaded, csv_amount_col_name, key_col, amount_col
             )
         else:
@@ -739,22 +757,33 @@ def main():
     # 自動統合済み working_df に手動マッピングをさらに適用して集計
     result_df = aggregate(working_df, key_col, amount_col, st.session_state.name_map)
     total_all = result_df[amount_col].sum()
+
+    # ── 残高チェック & 自動修正（CSVのみ） ──
+    if is_csv and ledger_total is not None:
+        if abs(total_all - ledger_total) >= 1:
+            # 差額あり → 誤スキップ行・訂正仕訳行を追加して自動修正を試みる
+            fix_parts: list[pd.DataFrame] = [working_df]
+            if not misskipped_df.empty:
+                m = misskipped_df.copy()
+                m[key_col] = m[key_col].map(lambda x: auto_name_map.get(x, x))
+                fix_parts.append(m)
+            if not correction_df.empty:
+                c = correction_df.copy()
+                c[key_col] = c[key_col].map(lambda x: auto_name_map.get(x, x))
+                fix_parts.append(c)
+            if len(fix_parts) > 1:
+                working_df_fixed = pd.concat(fix_parts, ignore_index=True)
+                result_df = aggregate(working_df_fixed, key_col, amount_col, st.session_state.name_map)
+                total_all = result_df[amount_col].sum()
+
+        diff = total_all - ledger_total
+        if abs(diff) < 1:
+            st.success("✅ 元帳と一致しています")
+        else:
+            st.error(f"⚠️ 差額 {diff:+,.0f}円 が解消できませんでした")
+
     total_count = len(result_df)
     result_df = collapse_to_top_n(result_df, key_col, amount_col, int(top_n))
-
-    # ── 残高チェック（CSVのみ） ──
-    if is_csv and ledger_total is not None:
-        diff = total_all - ledger_total
-        col_c1, col_c2, col_c3 = st.columns(3)
-        with col_c1:
-            st.metric(f"元帳の{csv_amount_col_name}合計", f"¥{ledger_total:,.0f}")
-        with col_c2:
-            st.metric("集計した合計金額", f"¥{total_all:,.0f}")
-        with col_c3:
-            if diff == 0:
-                st.success("✅ 元帳と一致しています")
-            else:
-                st.error(f"⚠️ 差額：{diff:+,.0f}円")
 
     # 表示列順：収入先名 | 取引内容（あれば） | 金額
     display_cols = [c for c in [key_col, CONTENT_COL, amount_col] if c in result_df.columns]
