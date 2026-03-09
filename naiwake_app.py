@@ -9,6 +9,7 @@
     2列目: 日付 / 7列目: 摘要（全角スペース区切り） / 14列目: 借方 / 15列目: 貸方
 """
 
+import csv
 import io
 import re
 import unicodedata
@@ -256,30 +257,44 @@ def load_csv_file(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     会計CSVファイル（Shift-JIS）を読み込み、整形済みDataFrameと生データを返す。
-    - 1列目が " #" で始まる行のみ処理
-    - 摘要列（CSV_COL_DESC）を全角スペース（\\u3000）で分割
+    - 列数がバラバラな行が混在するため csv モジュールで1行ずつ読み込む
+    - 1列目が CSV_ROW_MARKER（" #"）で始まる行のみ処理し、それ以外はすべてスキップ
+    - 摘要列（CSV_COL_DESC）を全角スペース（\u3000）で分割
     - 半角カナを全角カナに変換してから処理
     """
     content = uploaded.read()
-    raw = pd.read_csv(
-        io.BytesIO(content),
-        encoding='shift_jis',
-        header=None,
+    text = content.decode('shift_jis', errors='replace')
+
+    # csv モジュールで1行ずつ読み込み、1列目が CSV_ROW_MARKER で始まる行だけ収集
+    all_rows: list[list[str]] = []
+    filtered_rows: list[list[str]] = []
+    reader = csv.reader(io.StringIO(text))
+    for row in reader:
+        all_rows.append(row)
+        if row and row[0].startswith(CSV_ROW_MARKER):
+            filtered_rows.append(row)
+
+    # 生データ表示用 DataFrame（列数が異なる行が混在するため最大列数に合わせてパディング）
+    max_cols = max((len(r) for r in all_rows), default=0)
+    raw = pd.DataFrame(
+        [r + [""] * (max_cols - len(r)) for r in all_rows],
         dtype=str,
     )
 
-    # 1列目が CSV_ROW_MARKER で始まる行のみ処理
-    mask = raw.iloc[:, 0].fillna("").astype(str).str.startswith(CSV_ROW_MARKER)
-    filtered = raw[mask].reset_index(drop=True)
-
-    if filtered.empty:
+    if not filtered_rows:
         return pd.DataFrame(), raw
 
-    if filtered.shape[1] <= max(CSV_COL_DESC, amount_col_idx):
+    required_cols = max(CSV_COL_DESC, amount_col_idx) + 1
+    # 対象行の列数チェック（不足行は空文字でパディング）
+    padded_rows = [r + [""] * max(0, required_cols - len(r)) for r in filtered_rows]
+    min_cols = min(len(r) for r in padded_rows)
+    if min_cols < required_cols:
         raise ValueError(
-            f"列数が不足しています（{filtered.shape[1]}列）。"
-            f"最低でも {max(CSV_COL_DESC, amount_col_idx) + 1} 列必要です。"
+            f"列数が不足しています（最小 {min_cols} 列）。"
+            f"最低でも {required_cols} 列必要です。"
         )
+
+    filtered = pd.DataFrame(padded_rows, dtype=str)
 
     # 摘要列を取得し、半角カナを全角カナに変換
     desc_col = filtered.iloc[:, CSV_COL_DESC].fillna("").astype(str).str.strip()
