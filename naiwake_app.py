@@ -497,7 +497,17 @@ def load_csv_file(
             net        = main_amount - opp_amount  # 通常行：純額
             taxinc_net = main_raw    - opp_raw
 
-        if net == 0:
+        # ── net==0 の処理 ──
+        # 両方の生金額が 0（本当に空の行）→ スキップ
+        if main_raw == 0 and opp_raw == 0:
+            continue
+        # 貸方に金額があるのに net==0 になった場合
+        # （税抜き丸め誤差 / 列検出ズレなど）→ 貸方全額をマイナスで強制計上
+        if net == 0 and opp_raw > 0:
+            net        = -opp_amount
+            taxinc_net = -opp_raw
+        # 上記以外で net==0 （借方と貸方が完全に相殺） → スキップ
+        elif net == 0:
             continue
 
         taxinc_net_total += taxinc_net
