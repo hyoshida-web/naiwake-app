@@ -11,6 +11,7 @@
 
 import csv
 import io
+import math
 import re
 import unicodedata
 import difflib
@@ -41,7 +42,8 @@ MODES = {
         "csv_amount_col_name": "借方金額",
         "key_label": "支払先（貸主）名",
         "amount_label": "支払金額",
-        "default_top_n": 0,       # 0 = 全件表示
+        "default_top_n": 0,                    # 0 = 全件表示
+        "taxable_kaku_codes": {"31", "32", "33"},  # 課区がこれらなら税込み
     },
     "雑収入（医業外収益）": {
         "title": "雑収入（医業外収益）の内訳",
@@ -49,7 +51,8 @@ MODES = {
         "csv_amount_col_name": "貸方金額",
         "key_label": "収入先名",
         "amount_label": "収入金額",
-        "default_top_n": 15,      # 上位15件＋その他
+        "default_top_n": 15,                   # 上位15件＋その他
+        "taxable_kaku_codes": {"11"},           # 課区がこれなら税込み
     },
 }
 
@@ -145,6 +148,28 @@ def normalize_text(text):
     return text
 
 
+def calc_tax_excluded(
+    amount: float,
+    kaku_ku: str,
+    zei_ku: str,
+    taxable_kaku_codes: set[str],
+) -> float:
+    """
+    課区・税区に基づいて税抜き金額を計算する（端数は math.floor で切り捨て）。
+    - 課区が taxable_kaku_codes に含まれる場合のみ税抜き計算を適用する
+    - 税区 "10" / "71" → ÷1.1（10%）、税区 "9" / "70" → ÷1.08（8%）
+    - 上記以外の課区（非課税など）はそのまま返す
+    """
+    if kaku_ku.strip() not in taxable_kaku_codes:
+        return amount
+    zei = zei_ku.strip()
+    if zei in ("10", "71"):
+        return math.floor(amount / 1.1)
+    elif zei in ("9", "70"):
+        return math.floor(amount / 1.08)
+    return amount
+
+
 # ─────────────────────────────────────────────
 # ユーティリティ
 # ─────────────────────────────────────────────
@@ -181,14 +206,15 @@ def load_jdl_excel(
     amount_col_idx: int,
     key_label: str,
     amount_label: str,
+    taxable_kaku_codes: set[str],
     skiprows: int = 0,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     JDL元帳Excelを列位置で読み込み、整形済みDataFrameと生データを返す。
     - 全シートを読み込んで結合（複数月シート対応）
-    - 各シートのヘッダー行（1列目が「年月日」の行）を除去
+    - 各シートのヘッダー行（1列目が「年月日」の行）から課区・税区列を検出
     - 摘要列（COL_DESC）をスペース2つ以上で分割し、先頭部分を支払先/収入先名とする
-    - 金額列は借方 or 貸方をモードに応じて選択
+    - 課区・税区に基づき税抜き金額に変換してから集計する
     - 金額が0以下・空白の行は除外
     """
     # 全シートを読み込む（sheet_name=None で dict[シート名→DataFrame] を返す）
@@ -201,8 +227,23 @@ def load_jdl_excel(
             f"最低でも {max(COL_DESC, amount_col_idx) + 1} 列必要です。"
         )
 
-    # 各シートの列ヘッダー行を除去：1列目が「年月日」を含む行はヘッダーとみなしスキップ
+    # 各シートの列ヘッダー行を検出：1列目が「年月日」を含む行
     header_mask = raw.iloc[:, 0].fillna("").astype(str).str.contains("年月日", na=False)
+
+    # ヘッダー行から課区・税区の列インデックスを動的に取得
+    col_kaku_ku_idx: int | None = None
+    col_zei_ku_idx: int | None = None
+    header_rows = raw[header_mask]
+    if not header_rows.empty:
+        hrow = header_rows.iloc[0]
+        for i, cell in enumerate(hrow):
+            c = str(cell).strip()
+            if c == "課区":
+                col_kaku_ku_idx = i
+            elif c == "税区":
+                col_zei_ku_idx = i
+
+    # ヘッダー行を除去
     raw = raw[~header_mask].reset_index(drop=True)
 
     desc_col = raw.iloc[:, COL_DESC].fillna("").astype(str).str.strip()
@@ -219,13 +260,25 @@ def load_jdl_excel(
     extracted    = desc_col.apply(extract_payee_and_content)
     payee_col    = extracted.apply(lambda x: x[0])
     content_col  = extracted.apply(lambda x: x[1])
-    amount_col   = pd.to_numeric(raw.iloc[:, amount_col_idx], errors="coerce").fillna(0)
+
+    # 課区・税区列が検出できた場合は税抜き計算を適用する
+    raw_amounts = pd.to_numeric(raw.iloc[:, amount_col_idx], errors="coerce").fillna(0)
+    if col_kaku_ku_idx is not None and col_zei_ku_idx is not None:
+        kaku_ku_col = raw.iloc[:, col_kaku_ku_idx].fillna("").astype(str).str.strip()
+        zei_ku_col  = raw.iloc[:, col_zei_ku_idx].fillna("").astype(str).str.strip()
+        amount_col_data = pd.Series(
+            [calc_tax_excluded(a, k, z, taxable_kaku_codes)
+             for a, k, z in zip(raw_amounts, kaku_ku_col, zei_ku_col)],
+            index=raw_amounts.index,
+        )
+    else:
+        amount_col_data = raw_amounts
 
     df = pd.DataFrame({
-        key_label:   payee_col,
-        CONTENT_COL: content_col,
-        amount_label: amount_col,
-        "_desc":     desc_col,
+        key_label:    payee_col,
+        CONTENT_COL:  content_col,
+        amount_label: amount_col_data,
+        "_desc":      desc_col,
     })
 
     # スキップキーワードを含む行を除外（月計・繰越・消費税額振替・決算など）
@@ -264,14 +317,17 @@ def load_csv_file(
     amount_col_name: str,
     key_label: str,
     amount_label: str,
-) -> tuple[pd.DataFrame, pd.DataFrame, float | None]:
+    taxable_kaku_codes: set[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, float | None, pd.DataFrame, pd.DataFrame]:
     """
     会計CSVファイル（Shift-JIS）を読み込み、整形済みDataFrame・生データ・元帳合計を返す。
     - 列数がバラバラな行が混在するため csv モジュールで1行ずつ読み込む
-    - 「借方金額」「貸方金額」「摘要」「日付」を含むヘッダー行から列インデックスを動的に特定する
+    - 「借方金額」「貸方金額」「摘要」「日付」「課区」「税区」を含むヘッダー行から
+      列インデックスを動的に特定する
     - 1列目が CSV_ROW_MARKER（" #"）で始まる行のみ処理し、それ以外はすべてスキップ
     - 日付の月部分が 12 を超える行（決算仕訳）は除外する
     - 「合計金額」を含む行から元帳合計を取得し第3戻り値として返す
+    - 課区・税区に基づき税抜き金額に変換してから処理する
     - 摘要列を全角スペース（\u3000）で分割し、半角カナを全角カナに変換してから処理
     """
     content = uploaded.read()
@@ -283,6 +339,8 @@ def load_csv_file(
     col_desc_idx: int | None = None
     col_amount_idx: int | None = None
     col_date_idx: int | None = None
+    col_kaku_ku_idx: int | None = None
+    col_zei_ku_idx: int | None = None
     ledger_total: float | None = None
 
     reader = csv.reader(io.StringIO(text))
@@ -299,6 +357,10 @@ def load_csv_file(
                     col_date_idx = i
                 elif c == amount_col_name:
                     col_amount_idx = i
+                elif c == "課区":
+                    col_kaku_ku_idx = i
+                elif c == "税区":
+                    col_zei_ku_idx = i
             continue  # ヘッダー行自体はデータとして追加しない
 
         # 「合計金額」行の検出：元帳合計を取得
@@ -338,8 +400,13 @@ def load_csv_file(
             f"ヘッダー行に「{amount_col_name}」列が見つかりませんでした。"
         )
 
-    # データ行を DataFrame 化（必要列数に満たない行は空文字でパディング）
-    required_cols = max(col_desc_idx, col_amount_idx) + 1
+    # データ行を DataFrame 化（課区・税区を含む必要列数に満たない行は空文字でパディング）
+    needed_idxs = [col_desc_idx, col_amount_idx]
+    if col_kaku_ku_idx is not None:
+        needed_idxs.append(col_kaku_ku_idx)
+    if col_zei_ku_idx is not None:
+        needed_idxs.append(col_zei_ku_idx)
+    required_cols = max(needed_idxs) + 1
     padded_rows = [r + [""] * max(0, required_cols - len(r)) for r in filtered_rows]
     filtered = pd.DataFrame(padded_rows, dtype=str)
 
@@ -360,7 +427,19 @@ def load_csv_file(
     extracted   = desc_col.apply(extract_payee_and_content)
     payee_col   = extracted.apply(lambda x: x[0])
     content_col = extracted.apply(lambda x: x[1])
-    amount_col  = pd.to_numeric(filtered.iloc[:, col_amount_idx], errors="coerce").fillna(0)
+
+    # 課区・税区列が検出できた場合は税抜き計算を適用する
+    raw_amounts = pd.to_numeric(filtered.iloc[:, col_amount_idx], errors="coerce").fillna(0)
+    if col_kaku_ku_idx is not None and col_zei_ku_idx is not None:
+        kaku_ku_col = filtered.iloc[:, col_kaku_ku_idx].fillna("").astype(str).str.strip()
+        zei_ku_col  = filtered.iloc[:, col_zei_ku_idx].fillna("").astype(str).str.strip()
+        amount_col  = pd.Series(
+            [calc_tax_excluded(a, k, z, taxable_kaku_codes)
+             for a, k, z in zip(raw_amounts, kaku_ku_col, zei_ku_col)],
+            index=raw_amounts.index,
+        )
+    else:
+        amount_col = raw_amounts
 
     df = pd.DataFrame({
         key_label:    payee_col,
@@ -562,12 +641,13 @@ def main():
         horizontal=True,
     )
     cfg = MODES[mode_label]
-    key_col        = cfg["key_label"]
-    amount_col     = cfg["amount_label"]
-    title          = cfg["title"]
-    amount_col_idx = cfg["amount_col_idx"]
+    key_col             = cfg["key_label"]
+    amount_col          = cfg["amount_label"]
+    title               = cfg["title"]
+    amount_col_idx      = cfg["amount_col_idx"]
     csv_amount_col_name = cfg["csv_amount_col_name"]
-    default_top_n  = cfg["default_top_n"]
+    default_top_n       = cfg["default_top_n"]
+    taxable_kaku_codes  = cfg["taxable_kaku_codes"]
 
     st.divider()
 
@@ -614,11 +694,12 @@ def main():
     try:
         if is_csv:
             raw_df, raw_all, ledger_total, misskipped_df, correction_df = load_csv_file(
-                uploaded, csv_amount_col_name, key_col, amount_col
+                uploaded, csv_amount_col_name, key_col, amount_col, taxable_kaku_codes
             )
         else:
             raw_df, raw_all = load_jdl_excel(
-                uploaded, amount_col_idx, key_col, amount_col, skiprows=int(skiprows)
+                uploaded, amount_col_idx, key_col, amount_col, taxable_kaku_codes,
+                skiprows=int(skiprows)
             )
     except Exception as e:
         st.error(f"ファイルの読み込みに失敗しました: {e}")
