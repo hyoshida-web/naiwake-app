@@ -244,27 +244,46 @@ def load_jdl_excel(
     return df, raw
 
 
+def _parse_month_from_date(date_str: str) -> int | None:
+    """
+    会計CSV日付文字列（例：60404=令和6年4月4日）から月を取得する。
+    日付文字列の末尾4文字が MMDD 形式のため、[-4:-2] を月として返す。
+    パース失敗時は None を返す。
+    """
+    s = date_str.strip()
+    if len(s) >= 4:
+        try:
+            return int(s[-4:-2])
+        except ValueError:
+            pass
+    return None
+
+
 def load_csv_file(
     uploaded,
     amount_col_name: str,
     key_label: str,
     amount_label: str,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, float | None]:
     """
-    会計CSVファイル（Shift-JIS）を読み込み、整形済みDataFrameと生データを返す。
+    会計CSVファイル（Shift-JIS）を読み込み、整形済みDataFrame・生データ・元帳合計を返す。
     - 列数がバラバラな行が混在するため csv モジュールで1行ずつ読み込む
-    - 「借方金額」「貸方金額」「摘要」を含むヘッダー行から列インデックスを動的に特定する
+    - 「借方金額」「貸方金額」「摘要」「日付」を含むヘッダー行から列インデックスを動的に特定する
     - 1列目が CSV_ROW_MARKER（" #"）で始まる行のみ処理し、それ以外はすべてスキップ
+    - 日付の月部分が 12 を超える行（決算仕訳）は除外する
+    - 「合計金額」を含む行から元帳合計を取得し第3戻り値として返す
     - 摘要列を全角スペース（\u3000）で分割し、半角カナを全角カナに変換してから処理
     """
     content = uploaded.read()
     text = content.decode('shift_jis', errors='replace')
 
-    # csv モジュールで1行ずつ読み込み、ヘッダー行とデータ行を振り分ける
+    # csv モジュールで1行ずつ読み込み、ヘッダー行・データ行・合計行を振り分ける
     all_rows: list[list[str]] = []
     filtered_rows: list[list[str]] = []
     col_desc_idx: int | None = None
     col_amount_idx: int | None = None
+    col_date_idx: int | None = None
+    ledger_total: float | None = None
 
     reader = csv.reader(io.StringIO(text))
     for row in reader:
@@ -272,20 +291,32 @@ def load_csv_file(
 
         # ヘッダー行の検出：「借方金額」または「貸方金額」を含む行
         if col_desc_idx is None and ("借方金額" in row or "貸方金額" in row):
-            # 「摘要」列のインデックスを特定
             for i, cell in enumerate(row):
-                if cell.strip() == "摘要":
+                c = cell.strip()
+                if c == "摘要":
                     col_desc_idx = i
-                    break
-            # 指定された金額列名のインデックスを特定
-            for i, cell in enumerate(row):
-                if cell.strip() == amount_col_name:
+                elif c == "日付":
+                    col_date_idx = i
+                elif c == amount_col_name:
                     col_amount_idx = i
-                    break
             continue  # ヘッダー行自体はデータとして追加しない
+
+        # 「合計金額」行の検出：元帳合計を取得
+        if any("合計金額" in cell for cell in row):
+            if col_amount_idx is not None and col_amount_idx < len(row):
+                try:
+                    ledger_total = float(row[col_amount_idx].replace(",", "").strip())
+                except ValueError:
+                    pass
+            continue  # 合計行はデータとして追加しない
 
         # データ行：1列目が CSV_ROW_MARKER で始まる行のみ収集
         if row and row[0].startswith(CSV_ROW_MARKER):
+            # 日付の月が 12 を超える行は決算仕訳としてスキップ
+            if col_date_idx is not None and col_date_idx < len(row):
+                month = _parse_month_from_date(row[col_date_idx])
+                if month is not None and month > 12:
+                    continue
             filtered_rows.append(row)
 
     # 生データ表示用 DataFrame（列数が異なる行が混在するため最大列数に合わせてパディング）
@@ -296,7 +327,7 @@ def load_csv_file(
     )
 
     if not filtered_rows:
-        return pd.DataFrame(), raw
+        return pd.DataFrame(), raw, ledger_total
 
     if col_desc_idx is None:
         raise ValueError(
@@ -338,7 +369,7 @@ def load_csv_file(
         "_desc":      desc_col,
     })
 
-    # スキップキーワードを含む行を除外
+    # スキップキーワードを含む行を除外（摘要ベース：月計・繰越・消費税額振替・決算など）
     desc_no_space = desc_col.str.replace(r"\s+", "", regex=True)
     skip_pattern = "|".join(re.escape(kw) for kw in SKIP_KEYWORDS)
     df = df[~desc_no_space.str.contains(skip_pattern, na=False)]
@@ -350,7 +381,7 @@ def load_csv_file(
 
     df = df.drop(columns=["_desc"]).reset_index(drop=True)
 
-    return df, filtered
+    return df, filtered, ledger_total
 
 
 def auto_merge_by_frequency(
@@ -561,9 +592,10 @@ def main():
 
     # ── データ読み込み ──
     is_csv = uploaded.name.lower().endswith(".csv")
+    ledger_total: float | None = None
     try:
         if is_csv:
-            raw_df, raw_all = load_csv_file(
+            raw_df, raw_all, ledger_total = load_csv_file(
                 uploaded, csv_amount_col_name, key_col, amount_col
             )
         else:
@@ -709,6 +741,20 @@ def main():
     total_all = result_df[amount_col].sum()
     total_count = len(result_df)
     result_df = collapse_to_top_n(result_df, key_col, amount_col, int(top_n))
+
+    # ── 残高チェック（CSVのみ） ──
+    if is_csv and ledger_total is not None:
+        diff = total_all - ledger_total
+        col_c1, col_c2, col_c3 = st.columns(3)
+        with col_c1:
+            st.metric(f"元帳の{csv_amount_col_name}合計", f"¥{ledger_total:,.0f}")
+        with col_c2:
+            st.metric("集計した合計金額", f"¥{total_all:,.0f}")
+        with col_c3:
+            if diff == 0:
+                st.success("✅ 元帳と一致しています")
+            else:
+                st.error(f"⚠️ 差額：{diff:+,.0f}円")
 
     # 表示列順：収入先名 | 取引内容（あれば） | 金額
     display_cols = [c for c in [key_col, CONTENT_COL, amount_col] if c in result_df.columns]
