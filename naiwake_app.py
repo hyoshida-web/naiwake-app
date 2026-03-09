@@ -46,6 +46,7 @@ MODES = {
         "amount_label": "支払金額",
         "default_top_n": 0,                    # 0 = 全件表示
         "taxable_kaku_codes": {"31", "32", "33"},  # 課区がこれらなら税込み
+        "group_map": {},                        # 支払先名の強制統合マップ
     },
     "雑収入（医業外収益）": {
         "title": "雑収入（医業外収益）の内訳",
@@ -57,6 +58,9 @@ MODES = {
         "amount_label": "収入金額",
         "default_top_n": 15,                   # 上位15件＋その他
         "taxable_kaku_codes": {"11"},           # 課区がこれなら税込み
+        "group_map": {                          # 収入先名の強制統合マップ
+            "東洋リネンサプライ": "東洋リネン",
+        },
     },
 }
 
@@ -212,6 +216,7 @@ def load_jdl_excel(
     key_label: str,
     amount_label: str,
     taxable_kaku_codes: set[str],
+    group_map: dict[str, str] | None = None,
     skiprows: int = 0,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -254,6 +259,8 @@ def load_jdl_excel(
 
     desc_col = raw.iloc[:, COL_DESC].fillna("").astype(str).str.strip()
 
+    _group_map = group_map or {}
+
     def extract_payee_and_content(desc: str) -> tuple[str, str]:
         parts = re.split(r"\s{2,}", desc)
         payee   = normalize_text(parts[0].strip()) if parts else ""
@@ -261,6 +268,7 @@ def load_jdl_excel(
         # 「〇月分給与」など摘要に「給与」を含む行はすべて「寮費」に統合
         if "給与" in desc:
             return "寮費", "寮費"
+        payee = _group_map.get(payee, payee)
         return payee, content
 
     extracted    = desc_col.apply(extract_payee_and_content)
@@ -321,6 +329,7 @@ def load_csv_file(
     key_label: str,
     amount_label: str,
     taxable_kaku_codes: set[str],
+    group_map: dict[str, str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, float | None]:
     """
     会計CSVファイル（Shift-JIS）を読み込み、整形済みDataFrame・生データ・元帳残高を返す。
@@ -421,6 +430,7 @@ def load_csv_file(
 
     # ── 1行ずつ処理して records に蓄積 ──
     skip_pattern = "|".join(re.escape(kw) for kw in SKIP_KEYWORDS)
+    _group_map = group_map or {}
     records: list[dict] = []
 
     for row in filtered_rows:
@@ -461,9 +471,11 @@ def load_csv_file(
         elif "前期計上分戻入" in desc_ns or "当期計上分" in desc_ns:
             payee   = normalize_text(parts[1].strip()) if len(parts) > 1 else ""
             content = normalize_text(parts[2].strip()) if len(parts) > 2 else ""
+            payee   = _group_map.get(payee, payee)
         else:
             payee   = normalize_text(parts[0].strip()) if parts else ""
             content = normalize_text(parts[1].strip()) if len(parts) > 1 else ""
+            payee   = _group_map.get(payee, payee)
 
         if not payee or payee in ("nan", "NaN"):
             continue
@@ -651,6 +663,7 @@ def main():
     csv_opposite_col_name    = cfg["csv_opposite_col_name"]
     default_top_n            = cfg["default_top_n"]
     taxable_kaku_codes       = cfg["taxable_kaku_codes"]
+    group_map                = cfg["group_map"]
 
     st.divider()
 
@@ -696,12 +709,12 @@ def main():
         if is_csv:
             raw_df, raw_all, ledger_total = load_csv_file(
                 uploaded, csv_amount_col_name, csv_opposite_col_name,
-                key_col, amount_col, taxable_kaku_codes
+                key_col, amount_col, taxable_kaku_codes, group_map
             )
         else:
             raw_df, raw_all = load_jdl_excel(
                 uploaded, amount_col_idx, opposite_col_idx,
-                key_col, amount_col, taxable_kaku_codes,
+                key_col, amount_col, taxable_kaku_codes, group_map,
                 skiprows=int(skiprows)
             )
     except Exception as e:
