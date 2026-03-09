@@ -381,15 +381,17 @@ def load_csv_file(
     for row in reader:
         all_rows.append(row)
 
-        # ヘッダー行の検出：「借方金額」または「貸方金額」を含む行
-        if col_desc_idx is None and ("借方金額" in row or "貸方金額" in row):
+        # ヘッダー行の検出：「借方金額」または「貸方金額」を含む行（部分一致）
+        if col_desc_idx is None and any(
+            amount_col_name in cell or opposite_col_name in cell for cell in row
+        ):
             for i, cell in enumerate(row):
                 c = cell.strip()
                 if c == "摘要":
                     col_desc_idx = i
-                elif c == amount_col_name:
+                elif amount_col_name in c and col_amount_idx is None:
                     col_amount_idx = i
-                elif c == opposite_col_name:
+                elif opposite_col_name in c and col_opposite_idx is None:
                     col_opposite_idx = i
                 elif c == "残高":
                     col_balance_idx = i
