@@ -33,13 +33,16 @@ COL_CREDIT = 4  # 貸方
 CSV_ROW_MARKER = " #"  # 処理対象行の1列目プレフィックス（会計CSV）
 
 # 摘要列にこれらのキーワードを含む行は金額に関わらずスキップ
-SKIP_KEYWORDS = ["月計", "繰越", "消費税額振替", "決算", "当期計上分"]
+# ※「当期計上分」は主列（借方/貸方）に計上されるため通常行として処理する
+SKIP_KEYWORDS = ["月計", "繰越", "消費税額振替", "決算"]
 
 MODES = {
     "地代家賃": {
         "title": "地代家賃の内訳",
         "amount_col_idx": COL_DEBIT,
+        "opposite_col_idx": COL_CREDIT,
         "csv_amount_col_name": "借方金額",
+        "csv_opposite_col_name": "貸方金額",
         "key_label": "支払先（貸主）名",
         "amount_label": "支払金額",
         "default_top_n": 0,                    # 0 = 全件表示
@@ -48,7 +51,9 @@ MODES = {
     "雑収入（医業外収益）": {
         "title": "雑収入（医業外収益）の内訳",
         "amount_col_idx": COL_CREDIT,
+        "opposite_col_idx": COL_DEBIT,
         "csv_amount_col_name": "貸方金額",
+        "csv_opposite_col_name": "借方金額",
         "key_label": "収入先名",
         "amount_label": "収入金額",
         "default_top_n": 15,                   # 上位15件＋その他
@@ -204,6 +209,7 @@ def find_similar_groups(names: list[str], threshold: float) -> dict[str, list[st
 def load_jdl_excel(
     uploaded,
     amount_col_idx: int,
+    opposite_col_idx: int,
     key_label: str,
     amount_label: str,
     taxable_kaku_codes: set[str],
@@ -215,16 +221,17 @@ def load_jdl_excel(
     - 各シートのヘッダー行（1列目が「年月日」の行）から課区・税区列を検出
     - 摘要列（COL_DESC）をスペース2つ以上で分割し、先頭部分を支払先/収入先名とする
     - 課区・税区に基づき税抜き金額に変換してから集計する
-    - 金額が0以下・空白の行は除外
+    - 正列・逆列の差額（純額）を金額とする（返金・前期計上分戻入を自動でマイナス計上）
+    - 純額が0の行は除外
     """
     # 全シートを読み込む（sheet_name=None で dict[シート名→DataFrame] を返す）
     sheets = pd.read_excel(uploaded, header=None, skiprows=skiprows, dtype=str, sheet_name=None)
     raw = pd.concat(sheets.values(), ignore_index=True)
 
-    if raw.shape[1] <= max(COL_DESC, amount_col_idx):
+    if raw.shape[1] <= max(COL_DESC, amount_col_idx, opposite_col_idx):
         raise ValueError(
             f"列数が不足しています（{raw.shape[1]}列）。"
-            f"最低でも {max(COL_DESC, amount_col_idx) + 1} 列必要です。"
+            f"最低でも {max(COL_DESC, amount_col_idx, opposite_col_idx) + 1} 列必要です。"
         )
 
     # 各シートの列ヘッダー行を検出：1列目が「年月日」を含む行
@@ -261,8 +268,9 @@ def load_jdl_excel(
     payee_col    = extracted.apply(lambda x: x[0])
     content_col  = extracted.apply(lambda x: x[1])
 
-    # 課区・税区列が検出できた場合は税抜き計算を適用する
+    # 課区・税区列が検出できた場合は税抜き計算を適用する（主列・逆列ともに）
     raw_amounts = pd.to_numeric(raw.iloc[:, amount_col_idx], errors="coerce").fillna(0)
+    raw_opp_amounts = pd.to_numeric(raw.iloc[:, opposite_col_idx], errors="coerce").fillna(0)
     if col_kaku_ku_idx is not None and col_zei_ku_idx is not None:
         kaku_ku_col = raw.iloc[:, col_kaku_ku_idx].fillna("").astype(str).str.strip()
         zei_ku_col  = raw.iloc[:, col_zei_ku_idx].fillna("").astype(str).str.strip()
@@ -271,13 +279,22 @@ def load_jdl_excel(
              for a, k, z in zip(raw_amounts, kaku_ku_col, zei_ku_col)],
             index=raw_amounts.index,
         )
+        opp_col_data = pd.Series(
+            [calc_tax_excluded(a, k, z, taxable_kaku_codes)
+             for a, k, z in zip(raw_opp_amounts, kaku_ku_col, zei_ku_col)],
+            index=raw_opp_amounts.index,
+        )
     else:
         amount_col_data = raw_amounts
+        opp_col_data = raw_opp_amounts
+
+    # 純額 = 主列 − 逆列（返金・前期計上分戻入などを自動でマイナス計上）
+    net_amounts = amount_col_data - opp_col_data
 
     df = pd.DataFrame({
         key_label:    payee_col,
         CONTENT_COL:  content_col,
-        amount_label: amount_col_data,
+        amount_label: net_amounts,
         "_desc":      desc_col,
     })
 
@@ -287,8 +304,8 @@ def load_jdl_excel(
     skip_pattern = "|".join(re.escape(kw) for kw in SKIP_KEYWORDS)
     df = df[~desc_no_space.str.contains(skip_pattern, na=False)]
 
-    # 不要行の除外（金額0以下・支払先が空/nan文字列）
-    df = df[df[amount_label] > 0]
+    # 不要行の除外（純額0・支払先が空/nan文字列）
+    df = df[df[amount_label] != 0]
     df = df[df[key_label].notna()]
     df = df[~df[key_label].isin(["", "nan", "NaN"])]
 
@@ -315,6 +332,7 @@ def _parse_month_from_date(date_str: str) -> int | None:
 def load_csv_file(
     uploaded,
     amount_col_name: str,
+    opposite_col_name: str,
     key_label: str,
     amount_label: str,
     taxable_kaku_codes: set[str],
@@ -328,6 +346,7 @@ def load_csv_file(
     - 日付の月部分が 12 を超える行（決算仕訳）は除外する
     - 「合計金額」を含む行から元帳合計を取得し第3戻り値として返す
     - 課区・税区に基づき税抜き金額に変換してから処理する
+    - 純額 = 主列 − 逆列（返金・前期計上分戻入などを自動でマイナス計上）
     - 摘要列を全角スペース（\u3000）で分割し、半角カナを全角カナに変換してから処理
     """
     content = uploaded.read()
@@ -338,6 +357,7 @@ def load_csv_file(
     filtered_rows: list[list[str]] = []
     col_desc_idx: int | None = None
     col_amount_idx: int | None = None
+    col_opposite_idx: int | None = None
     col_date_idx: int | None = None
     col_kaku_ku_idx: int | None = None
     col_zei_ku_idx: int | None = None
@@ -357,6 +377,8 @@ def load_csv_file(
                     col_date_idx = i
                 elif c == amount_col_name:
                     col_amount_idx = i
+                elif c == opposite_col_name:
+                    col_opposite_idx = i
                 elif c == "課区":
                     col_kaku_ku_idx = i
                 elif c == "税区":
@@ -402,6 +424,8 @@ def load_csv_file(
 
     # データ行を DataFrame 化（課区・税区を含む必要列数に満たない行は空文字でパディング）
     needed_idxs = [col_desc_idx, col_amount_idx]
+    if col_opposite_idx is not None:
+        needed_idxs.append(col_opposite_idx)
     if col_kaku_ku_idx is not None:
         needed_idxs.append(col_kaku_ku_idx)
     if col_zei_ku_idx is not None:
@@ -428,23 +452,37 @@ def load_csv_file(
     payee_col   = extracted.apply(lambda x: x[0])
     content_col = extracted.apply(lambda x: x[1])
 
-    # 課区・税区列が検出できた場合は税抜き計算を適用する
+    # 課区・税区列が検出できた場合は税抜き計算を適用する（主列・逆列ともに）
     raw_amounts = pd.to_numeric(filtered.iloc[:, col_amount_idx], errors="coerce").fillna(0)
+    raw_opp_amounts = (
+        pd.to_numeric(filtered.iloc[:, col_opposite_idx], errors="coerce").fillna(0)
+        if col_opposite_idx is not None
+        else pd.Series(0.0, index=raw_amounts.index)
+    )
     if col_kaku_ku_idx is not None and col_zei_ku_idx is not None:
         kaku_ku_col = filtered.iloc[:, col_kaku_ku_idx].fillna("").astype(str).str.strip()
         zei_ku_col  = filtered.iloc[:, col_zei_ku_idx].fillna("").astype(str).str.strip()
-        amount_col  = pd.Series(
+        amount_col_data = pd.Series(
             [calc_tax_excluded(a, k, z, taxable_kaku_codes)
              for a, k, z in zip(raw_amounts, kaku_ku_col, zei_ku_col)],
             index=raw_amounts.index,
         )
+        opp_col_data = pd.Series(
+            [calc_tax_excluded(a, k, z, taxable_kaku_codes)
+             for a, k, z in zip(raw_opp_amounts, kaku_ku_col, zei_ku_col)],
+            index=raw_opp_amounts.index,
+        )
     else:
-        amount_col = raw_amounts
+        amount_col_data = raw_amounts
+        opp_col_data = raw_opp_amounts
+
+    # 純額 = 主列 − 逆列（返金・前期計上分戻入などを自動でマイナス計上）
+    net_amounts = amount_col_data - opp_col_data
 
     df = pd.DataFrame({
         key_label:    payee_col,
         CONTENT_COL:  content_col,
-        amount_label: amount_col,
+        amount_label: net_amounts,
         "_desc":      desc_col,
     })
 
@@ -453,24 +491,19 @@ def load_csv_file(
     skip_pattern = "|".join(re.escape(kw) for kw in SKIP_KEYWORDS)
     skip_mask = desc_no_space.str.contains(skip_pattern, na=False)
 
-    # 誤スキップ候補：SKIP_KEYWORDS に該当するが対象金額がある行（自動修正で再投入）
+    # 誤スキップ候補：SKIP_KEYWORDS に該当するが純額がある行（自動修正で再投入）
     misskipped_df = (
-        df[skip_mask & (df[amount_label] > 0)]
+        df[skip_mask & (df[amount_label] != 0)]
         .drop(columns=["_desc"])
         .reset_index(drop=True)
     )
 
-    # 訂正仕訳候補：SKIP_KEYWORDS 非該当でマイナス金額・有効支払先の行（自動修正で差し引き）
-    valid_payee_mask = df[key_label].notna() & ~df[key_label].isin(["", "nan", "NaN"])
-    correction_df = (
-        df[~skip_mask & (df[amount_label] < 0) & valid_payee_mask]
-        .drop(columns=["_desc"])
-        .reset_index(drop=True)
-    )
+    # 訂正仕訳候補：純額計算により自動的にマイナス計上されるため不要
+    correction_df = pd.DataFrame()
 
-    # 本体フィルタ：スキップ対象外・金額正・有効な支払先のみ
+    # 本体フィルタ：スキップ対象外・純額0以外・有効な支払先のみ
     df = df[~skip_mask]
-    df = df[df[amount_label] > 0]
+    df = df[df[amount_label] != 0]
     df = df[df[key_label].notna()]
     df = df[~df[key_label].isin(["", "nan", "NaN"])]
 
@@ -641,13 +674,15 @@ def main():
         horizontal=True,
     )
     cfg = MODES[mode_label]
-    key_col             = cfg["key_label"]
-    amount_col          = cfg["amount_label"]
-    title               = cfg["title"]
-    amount_col_idx      = cfg["amount_col_idx"]
-    csv_amount_col_name = cfg["csv_amount_col_name"]
-    default_top_n       = cfg["default_top_n"]
-    taxable_kaku_codes  = cfg["taxable_kaku_codes"]
+    key_col                  = cfg["key_label"]
+    amount_col               = cfg["amount_label"]
+    title                    = cfg["title"]
+    amount_col_idx           = cfg["amount_col_idx"]
+    opposite_col_idx         = cfg["opposite_col_idx"]
+    csv_amount_col_name      = cfg["csv_amount_col_name"]
+    csv_opposite_col_name    = cfg["csv_opposite_col_name"]
+    default_top_n            = cfg["default_top_n"]
+    taxable_kaku_codes       = cfg["taxable_kaku_codes"]
 
     st.divider()
 
@@ -694,11 +729,13 @@ def main():
     try:
         if is_csv:
             raw_df, raw_all, ledger_total, misskipped_df, correction_df = load_csv_file(
-                uploaded, csv_amount_col_name, key_col, amount_col, taxable_kaku_codes
+                uploaded, csv_amount_col_name, csv_opposite_col_name,
+                key_col, amount_col, taxable_kaku_codes
             )
         else:
             raw_df, raw_all = load_jdl_excel(
-                uploaded, amount_col_idx, key_col, amount_col, taxable_kaku_codes,
+                uploaded, amount_col_idx, opposite_col_idx,
+                key_col, amount_col, taxable_kaku_codes,
                 skiprows=int(skiprows)
             )
     except Exception as e:
