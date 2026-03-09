@@ -50,6 +50,10 @@ MODES = {
             "半場新一": "半場進一",              # 誤字修正
             "加藤":   "加藤純",                  # 名前の省略形を正式名称に統一
         },
+        # 消費税振替後の残高は使えないため「合計金額」行の借方合計を正解値として使用する
+        # 税込み集計合計との比較なので端数誤差は小さく ±1,000 で判定する
+        "ledger_check": "total_row",
+        "ledger_tolerance": 1_000,
     },
     "雑収入（医業外収益）": {
         "title": "雑収入（医業外収益）の内訳",
@@ -64,6 +68,9 @@ MODES = {
         "group_map": {                          # 収入先名の強制統合マップ
             "東洋リネンサプライ": "東洋リネン",
         },
+        # 残高列の最終値（元帳終了直前）を正解値として使用する
+        "ledger_check": "final_balance",
+        "ledger_tolerance": 1_000,
     },
 }
 
@@ -338,9 +345,14 @@ def load_csv_file(
     amount_label: str,
     taxable_kaku_codes: set[str],
     group_map: dict[str, str] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, float | None]:
+) -> tuple[pd.DataFrame, pd.DataFrame, float | None, float | None, float]:
     """
-    会計CSVファイル（Shift-JIS）を読み込み、整形済みDataFrame・生データ・元帳残高を返す。
+    会計CSVファイル（Shift-JIS）を読み込み、以下の5値を返す。
+      df                : 整形済みDataFrame（税抜き純額）
+      raw               : 生データDataFrame
+      ledger_final_balance : 「元帳終了」直前の残高列最終値（雑収入モード向け）
+      ledger_total_row  : 「合計金額」行の主列値（地代家賃モード向け）
+      taxinc_net_total  : 集計行の税込み純額の合計（地代家賃モード残高チェック用）
 
     集計ロジック（1列目が CSV_ROW_MARKER の行を対象）：
     ・スキップ行（SKIP_KEYWORDS に該当）→ 除外
@@ -348,8 +360,6 @@ def load_csv_file(
     ・当期計上分     → 主列金額をプラスとして計上
     ・通常行         → 主列 − 逆列 の純額を計上
     ・いずれも税抜き計算を適用する
-
-    元帳残高：「元帳終了」行の直前に出現した残高列の最終値を使用する。
     """
     content = uploaded.read()
     text = content.decode('shift_jis', errors='replace')
@@ -363,8 +373,9 @@ def load_csv_file(
     col_balance_idx: int | None = None
     col_kaku_ku_idx: int | None = None
     col_zei_ku_idx: int | None = None
-    ledger_total: float | None = None
-    last_balance: float | None = None  # 残高列の最終値（元帳終了直前）
+    ledger_final_balance: float | None = None   # 残高列の最終値（元帳終了直前）
+    ledger_total_row: float | None = None       # 「合計金額」行の主列値
+    last_balance: float | None = None
 
     reader = csv.reader(io.StringIO(text))
     for row in reader:
@@ -388,10 +399,21 @@ def load_csv_file(
                     col_zei_ku_idx = i
             continue  # ヘッダー行自体はデータとして追加しない
 
-        # 「元帳終了」行の検出：直前までの残高最終値を元帳合計として確定
+        # 「合計金額」行の検出：主列（借方/貸方）の合計値を取得
+        if any("合計金額" in cell for cell in row):
+            if col_amount_idx is not None and col_amount_idx < len(row):
+                val = row[col_amount_idx].replace(",", "").strip()
+                if val:
+                    try:
+                        ledger_total_row = float(val)
+                    except ValueError:
+                        pass
+            continue
+
+        # 「元帳終了」行の検出：直前までの残高最終値を確定
         if any("元帳終了" in cell for cell in row):
             if last_balance is not None:
-                ledger_total = last_balance
+                ledger_final_balance = last_balance
             continue
 
         # 残高列の最終値を追跡（元帳終了直前の値が正解値になる）
@@ -415,7 +437,7 @@ def load_csv_file(
     )
 
     if not filtered_rows:
-        return pd.DataFrame(), raw, ledger_total
+        return pd.DataFrame(), raw, ledger_final_balance, ledger_total_row, 0.0
 
     if col_desc_idx is None:
         raise ValueError(
@@ -440,6 +462,7 @@ def load_csv_file(
     skip_pattern = "|".join(re.escape(kw) for kw in SKIP_KEYWORDS)
     _group_map = group_map or {}
     records: list[dict] = []
+    taxinc_net_total: float = 0.0  # 税込み純額の合計（地代家賃モード残高チェック用）
 
     for row in filtered_rows:
         # 摘要（半角カナ→全角カナ変換済み、スペース除去版も用意）
@@ -455,20 +478,29 @@ def load_csv_file(
         kaku = row[col_kaku_ku_idx].strip() if col_kaku_ku_idx is not None and col_kaku_ku_idx < len(row) else ""
         zei  = row[col_zei_ku_idx].strip()  if col_zei_ku_idx  is not None and col_zei_ku_idx  < len(row) else ""
 
-        # 主列・逆列の税抜き金額
-        main_amount = calc_tax_excluded(_cell_float(row, col_amount_idx),   kaku, zei, taxable_kaku_codes)
-        opp_amount  = calc_tax_excluded(_cell_float(row, col_opposite_idx), kaku, zei, taxable_kaku_codes)
+        # 税込みの生金額（残高チェック用）
+        main_raw = _cell_float(row, col_amount_idx)
+        opp_raw  = _cell_float(row, col_opposite_idx)
 
-        # 金額区分
+        # 税抜き金額（集計用）
+        main_amount = calc_tax_excluded(main_raw, kaku, zei, taxable_kaku_codes)
+        opp_amount  = calc_tax_excluded(opp_raw,  kaku, zei, taxable_kaku_codes)
+
+        # 金額区分（税抜き純額 / 税込み純額 を並行計算）
         if "前期計上分戻入" in desc_ns:
-            net = -opp_amount           # 逆列をマイナスで計上
+            net        = -opp_amount   # 逆列をマイナスで計上
+            taxinc_net = -opp_raw
         elif "当期計上分" in desc_ns:
-            net = main_amount           # 主列をプラスで計上
+            net        = main_amount   # 主列をプラスで計上
+            taxinc_net = main_raw
         else:
-            net = main_amount - opp_amount  # 通常行：純額
+            net        = main_amount - opp_amount  # 通常行：純額
+            taxinc_net = main_raw    - opp_raw
 
         if net == 0:
             continue
+
+        taxinc_net_total += taxinc_net
 
         # 支払先・取引内容を摘要から抽出（全角スペース区切り）
         # 「前期計上分戻入」「当期計上分」を含む行は parts[0] がキーワード自身のため
@@ -497,7 +529,7 @@ def load_csv_file(
     )
     df = df.reset_index(drop=True)
 
-    return df, raw, ledger_total
+    return df, raw, ledger_final_balance, ledger_total_row, taxinc_net_total
 
 
 def auto_merge_by_frequency(
@@ -672,6 +704,8 @@ def main():
     default_top_n            = cfg["default_top_n"]
     taxable_kaku_codes       = cfg["taxable_kaku_codes"]
     group_map                = cfg["group_map"]
+    ledger_check             = cfg["ledger_check"]
+    ledger_tolerance         = cfg["ledger_tolerance"]
 
     st.divider()
 
@@ -713,12 +747,18 @@ def main():
     # ── データ読み込み ──
     is_csv = uploaded.name.lower().endswith(".csv")
     ledger_total: float | None = None
+    _taxinc_net_total: float = 0.0
     try:
         if is_csv:
-            raw_df, raw_all, ledger_total = load_csv_file(
+            raw_df, raw_all, _final_balance, _total_row, _taxinc_net_total = load_csv_file(
                 uploaded, csv_amount_col_name, csv_opposite_col_name,
                 key_col, amount_col, taxable_kaku_codes, group_map
             )
+            # モードに応じて残高チェックの正解値を選択
+            if ledger_check == "total_row":
+                ledger_total = _total_row      # 合計金額行の借方合計
+            else:
+                ledger_total = _final_balance  # 残高列の最終値
         else:
             raw_df, raw_all = load_jdl_excel(
                 uploaded, amount_col_idx, opposite_col_idx,
@@ -865,8 +905,11 @@ def main():
 
     # ── 残高チェック（CSVのみ） ──
     if is_csv and ledger_total is not None:
-        diff = total_all - ledger_total
-        if abs(diff) <= 1000:
+        # 地代家賃：税込み純額合計 vs 合計金額行の借方合計で比較
+        # 雑収入  ：税抜き集計合計 vs 残高列最終値で比較
+        check_total = _taxinc_net_total if ledger_check == "total_row" else total_all
+        diff = check_total - ledger_total
+        if abs(diff) <= ledger_tolerance:
             st.success(f"✅ 元帳とほぼ一致しています（誤差：{diff:+,.0f}円）")
         else:
             st.error(f"⚠️ 差額 {diff:+,.0f}円 が解消できませんでした")
