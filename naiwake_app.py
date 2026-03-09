@@ -453,9 +453,14 @@ def load_csv_file(
             continue
 
         # 支払先・取引内容を摘要から抽出（全角スペース区切り）
+        # 「前期計上分戻入」「当期計上分」を含む行は parts[0] がキーワード自身のため
+        # parts[1] を支払先、parts[2] を取引内容として使用する
         parts = desc.split('\u3000')
         if "給与" in desc:
             payee, content = "寮費", "寮費"
+        elif "前期計上分戻入" in desc_ns or "当期計上分" in desc_ns:
+            payee   = normalize_text(parts[1].strip()) if len(parts) > 1 else ""
+            content = normalize_text(parts[2].strip()) if len(parts) > 2 else ""
         else:
             payee   = normalize_text(parts[0].strip()) if parts else ""
             content = normalize_text(parts[1].strip()) if len(parts) > 1 else ""
