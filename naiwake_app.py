@@ -305,11 +305,11 @@ def load_jdl_excel(
     payee_col    = extracted.apply(lambda x: x[0])
     content_col  = extracted.apply(lambda x: x[1])
 
-    # 課区・税区列が検出できた場合は税抜き計算を適用する（主列・逆列ともに）
-    # ※ apply_tax_exclusion は残高チェック基準値の切り替えのみに使用し、集計には影響しない
+    # 課区・税区列が検出できた場合かつ税抜き法人の場合に税抜き計算を適用する（主列・逆列ともに）
+    # 税込み法人（apply_tax_exclusion=False）は生金額をそのまま使用する
     raw_amounts = pd.to_numeric(raw.iloc[:, amount_col_idx], errors="coerce").fillna(0)
     raw_opp_amounts = pd.to_numeric(raw.iloc[:, opposite_col_idx], errors="coerce").fillna(0)
-    if col_kaku_ku_idx is not None and col_zei_ku_idx is not None:
+    if apply_tax_exclusion and col_kaku_ku_idx is not None and col_zei_ku_idx is not None:
         kaku_ku_col = raw.iloc[:, col_kaku_ku_idx].fillna("").astype(str).str.strip()
         zei_ku_col  = raw.iloc[:, col_zei_ku_idx].fillna("").astype(str).str.strip()
         amount_col_data = pd.Series(
@@ -456,27 +456,15 @@ def load_csv_file(
     )
 
     # ── 税抜き計算フラグの決定 ──
-    # 決算月（2列目の月が12より大きい）の行に「消費税額振替」があれば税抜き法人
+    # 摘要列に「消費税額振替」が含まれる行があれば税抜き法人（Excel側の検出と同一ロジック）
+    # ※ 日付による決算月判定は日付フォーマット依存で誤検出があるため使用しない
     apply_tax_exclusion: bool = False
     if col_desc_idx is not None:
         for _row in filtered_rows:
             _desc_cell = re.sub(r"\s+", "", hankaku_to_zenkaku(
                 _row[col_desc_idx].strip() if col_desc_idx < len(_row) else ""
             ))
-            if "消費税額振替" not in _desc_cell:
-                continue
-            # 決算月判定：2列目（日付）の月が12より大きい
-            _is_kessan = False
-            if len(_row) > 1:
-                _parts = _row[1].strip().split('/')
-                try:
-                    _month = (int(_parts[1]) if len(_parts) >= 3
-                              else int(_parts[0]) if len(_parts) == 2
-                              else -1)
-                    _is_kessan = _month > 12
-                except (ValueError, IndexError):
-                    pass
-            if _is_kessan:
+            if "消費税額振替" in _desc_cell:
                 apply_tax_exclusion = True
                 break
 
@@ -526,10 +514,15 @@ def load_csv_file(
         main_raw = _cell_float(row, col_amount_idx)
         opp_raw  = _cell_float(row, col_opposite_idx)
 
-        # 税抜き金額（集計用）
-        # ※ apply_tax_exclusion は残高チェック基準値の切り替えのみに使用し、集計には影響しない
-        main_amount = calc_tax_excluded(main_raw, kaku, zei, taxable_kaku_codes)
-        opp_amount  = calc_tax_excluded(opp_raw,  kaku, zei, taxable_kaku_codes)
+        # 集計用金額：税抜き法人のみ課区・税区に基づいて税抜き計算を適用する
+        # 税込み法人（apply_tax_exclusion=False）は生金額をそのまま使用する
+        # ※ 前期計上分戻入・当期計上分の処理ロジック自体は apply_tax_exclusion によらず同一
+        if apply_tax_exclusion:
+            main_amount = calc_tax_excluded(main_raw, kaku, zei, taxable_kaku_codes)
+            opp_amount  = calc_tax_excluded(opp_raw,  kaku, zei, taxable_kaku_codes)
+        else:
+            main_amount = main_raw
+            opp_amount  = opp_raw
 
         # 金額区分（税抜き純額 / 税込み純額 を並行計算）
         if "前期計上分戻入" in desc_ns:
