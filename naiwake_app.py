@@ -49,6 +49,7 @@ MODES = {
         "group_map": {                          # 支払先名の強制統合マップ
             "半場新一": "半場進一",              # 誤字修正
             "加藤":   "加藤純",                  # 名前の省略形を正式名称に統一
+            "ゴキタジュンコ（羽鳥菜佑家賃）": "ゴキタジュンコ",  # 括弧付き注記を除去
         },
         "group_by_content": False,             # 支払先名のみで集計
         # 消費税振替後の残高は使えないため「合計金額」行の借方合計を正解値として使用する
@@ -168,6 +169,8 @@ def normalize_text(text):
     # 斎藤系異体字を統一
     for v in ['斉', '斎']:
         text = text.replace(v, '齋')
+    # 渡辺系異体字を統一（渡邉・渡邊 → 渡辺）
+    text = text.replace('渡邉', '渡辺').replace('渡邊', '渡辺')
     # 括弧付き注記を除去（例：齋藤直永（...）→ 齋藤直永）
     text = re.sub(r'（[^）]*）', '', text).strip()
     return text
@@ -941,8 +944,65 @@ def main():
 
     st.divider()
 
-    # ── 集計 ──
-    st.subheader("④ 集計結果プレビュー")
+    # ── 名寄せ設定 ──
+    st.subheader("④ 名寄せ設定（任意）")
+
+    # GROUP_MAP の統合対象（values）と「寮費」は取引内容を問わず payee 単位でまとめる
+    merge_only_payees = (set(group_map.values()) | {"寮費"}) if group_by_content else None
+
+    # 集計後の支払先一覧を取得（ドロップダウンの選択肢 & 以降のプレビューに共用）
+    result_df = aggregate(
+        working_df, key_col, amount_col, st.session_state.name_map,
+        group_by_content=group_by_content,
+        merge_only_payees=merge_only_payees,
+    )
+    total_all = result_df[amount_col].sum()
+
+    aggregated_names = result_df[key_col].unique().tolist()
+
+    st.caption("集計後の支払先を2つ選んで統合できます。件数が多い方の名称が正式名称として採用されます。")
+    col_a, col_b, col_btn = st.columns([3, 3, 1])
+    with col_a:
+        merge_name_a = st.selectbox(
+            "統合元 A", [""] + aggregated_names, key="merge_a",
+        )
+    with col_b:
+        merge_name_b = st.selectbox(
+            "統合元 B", [""] + aggregated_names, key="merge_b",
+        )
+    with col_btn:
+        st.write("")
+        st.write("")
+        if st.button("統合する", use_container_width=True, key="btn_merge"):
+            if merge_name_a and merge_name_b and merge_name_a != merge_name_b:
+                # working_df に現在の name_map を適用した状態で件数を比較
+                applied_names = working_df[key_col].map(
+                    lambda x: st.session_state.name_map.get(x, x)
+                )
+                count_a = (applied_names == merge_name_a).sum()
+                count_b = (applied_names == merge_name_b).sum()
+                canonical = merge_name_a if count_a >= count_b else merge_name_b
+                other     = merge_name_b if count_a >= count_b else merge_name_a
+                st.session_state.name_map[other] = canonical
+                st.rerun()
+            elif merge_name_a == merge_name_b and merge_name_a:
+                st.warning("同じ名称が選択されています。別の組み合わせを選んでください。")
+
+    if st.session_state.name_map:
+        with st.expander("現在の名寄せ設定を確認する", expanded=False):
+            map_df = pd.DataFrame(
+                list(st.session_state.name_map.items()),
+                columns=["統合前", "統合後（正式名称）"],
+            )
+            st.dataframe(map_df, use_container_width=True, hide_index=True)
+            if st.button("名寄せをリセット", key="btn_reset_merge"):
+                st.session_state.name_map = {}
+                st.rerun()
+
+    st.divider()
+
+    # ── 集計結果プレビュー ──
+    st.subheader("⑤ 集計結果プレビュー")
 
     col_topn, _ = st.columns([1, 3])
     with col_topn:
@@ -954,18 +1014,6 @@ def main():
             step=1,
             help="指定件数を超える分は「その他（N件）」1行にまとめます",
         )
-
-    # group_by_content=True の場合、GROUP_MAP の統合対象（values）と「寮費」は
-    # 取引内容を問わず payee 単位でまとめる
-    merge_only_payees = (set(group_map.values()) | {"寮費"}) if group_by_content else None
-
-    # 自動統合済み working_df に手動マッピングをさらに適用して集計
-    result_df = aggregate(
-        working_df, key_col, amount_col, st.session_state.name_map,
-        group_by_content=group_by_content,
-        merge_only_payees=merge_only_payees,
-    )
-    total_all = result_df[amount_col].sum()
 
     # ── 残高チェック（CSVのみ） ──
     if is_csv and ledger_total is not None:
@@ -999,7 +1047,7 @@ def main():
     st.divider()
 
     # ── Excelダウンロード ──
-    st.subheader("⑤ Excelダウンロード")
+    st.subheader("⑥ Excelダウンロード")
 
     excel_bytes = to_excel_bytes(result_df[display_cols], title, amount_col)
 
