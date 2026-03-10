@@ -52,9 +52,9 @@ MODES = {
             "ゴキタジュンコ（羽鳥菜佑家賃）": "ゴキタジュンコ",  # 括弧付き注記を除去
         },
         "group_by_content": False,             # 支払先名のみで集計
-        # 消費税振替後の残高は使えないため「合計金額」行の借方合計を正解値として使用する
-        # 税込み集計合計との比較なので端数誤差は小さく ±1,000 で判定する
-        "ledger_check": "total_row",
+        # 残高チェック基準値：
+        #   税抜き法人 → 「合計金額」行の借方合計（消費税振替後の残高は使えないため）
+        #   税込み法人 → 最終残高（元帳終了直前の残高列の値）
         "ledger_tolerance": 1_000,
     },
     "雑収入（医業外収益）": {
@@ -71,8 +71,9 @@ MODES = {
             "東洋リネンサプライ": "東洋リネン",
         },
         "group_by_content": True,              # 収入先名＋取引内容の組み合わせで集計
-        # 残高列の最終値（元帳終了直前）を正解値として使用する
-        "ledger_check": "final_balance",
+        # 残高チェック基準値：
+        #   税抜き法人 → 「合計金額」行の貸方合計（消費税振替後の残高は使えないため）
+        #   税込み法人 → 最終残高（元帳終了直前の残高列の値）
         "ledger_tolerance": 1_000,
     },
 }
@@ -802,7 +803,6 @@ def main():
     taxable_kaku_codes       = cfg["taxable_kaku_codes"]
     group_map                = cfg["group_map"]
     group_by_content         = cfg.get("group_by_content", False)
-    ledger_check             = cfg["ledger_check"]
     ledger_tolerance         = cfg["ledger_tolerance"]
 
     st.divider()
@@ -853,11 +853,11 @@ def main():
                 uploaded, csv_amount_col_name, csv_opposite_col_name,
                 key_col, amount_col, taxable_kaku_codes, group_map
             )
-            # モードに応じて残高チェックの正解値を選択
-            if ledger_check == "total_row":
-                ledger_total = _total_row      # 合計金額行の借方合計
+            # 税抜き/税込みに応じて残高チェックの正解値を選択
+            if apply_tax_exclusion:
+                ledger_total = _total_row      # 税抜き法人：合計金額行の主列合計（借方 or 貸方）
             else:
-                ledger_total = _final_balance  # 残高列の最終値
+                ledger_total = _final_balance  # 税込み法人：最終残高
         else:
             raw_df, raw_all, apply_tax_exclusion = load_jdl_excel(
                 uploaded, amount_col_idx, opposite_col_idx,
@@ -1063,9 +1063,9 @@ def main():
 
     # ── 残高チェック（CSVのみ） ──
     if is_csv and ledger_total is not None:
-        # 地代家賃：税込み純額合計 vs 合計金額行の借方合計で比較
-        # 雑収入  ：税抜き集計合計 vs 残高列最終値で比較
-        check_total = _taxinc_net_total if ledger_check == "total_row" else total_all
+        # 税抜き法人：税込み純額合計 vs 合計金額行の主列合計（借方 or 貸方）
+        # 税込み法人：税抜き集計合計（＝税込み金額そのまま） vs 最終残高
+        check_total = _taxinc_net_total if apply_tax_exclusion else total_all
         diff = check_total - ledger_total
         if abs(diff) <= ledger_tolerance:
             st.success(f"✅ 元帳とほぼ一致しています（誤差：{diff:+,.0f}円）")
