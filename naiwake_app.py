@@ -238,13 +238,14 @@ def load_jdl_excel(
     taxable_kaku_codes: set[str],
     group_map: dict[str, str] | None = None,
     skiprows: int = 0,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, bool]:
     """
-    JDL元帳Excelを列位置で読み込み、整形済みDataFrameと生データを返す。
+    JDL元帳Excelを列位置で読み込み、整形済みDataFrameと生データと税抜きフラグを返す。
     - 全シートを読み込んで結合（複数月シート対応）
     - 各シートのヘッダー行（1列目が「年月日」の行）から課区・税区列を検出
     - 摘要列（COL_DESC）をスペース2つ以上で分割し、先頭部分を支払先/収入先名とする
-    - 課区・税区に基づき税抜き金額に変換してから集計する
+    - 全シートに「消費税額振替」の行が存在する場合（税抜き法人）のみ税抜き計算を適用する
+    - 「消費税額振替」の行がない場合（税込み法人）は金額をそのまま使用する
     - 正列・逆列の差額（純額）を金額とする（返金・前期計上分戻入を自動でマイナス計上）
     - 純額が0の行は除外
     """
@@ -277,6 +278,14 @@ def load_jdl_excel(
     # ヘッダー行を除去
     raw = raw[~header_mask].reset_index(drop=True)
 
+    # 税抜き計算フラグの決定
+    # 全シートの摘要列をスキャンし「消費税額振替」の行があれば税抜き法人
+    _desc_nospace = (
+        raw.iloc[:, COL_DESC].fillna("").astype(str)
+        .str.replace(r"\s+", "", regex=True)
+    )
+    apply_tax_exclusion: bool = _desc_nospace.str.contains("消費税額振替", na=False).any()
+
     desc_col = raw.iloc[:, COL_DESC].fillna("").astype(str).str.strip()
 
     _group_map = group_map or {}
@@ -295,10 +304,10 @@ def load_jdl_excel(
     payee_col    = extracted.apply(lambda x: x[0])
     content_col  = extracted.apply(lambda x: x[1])
 
-    # 課区・税区列が検出できた場合は税抜き計算を適用する（主列・逆列ともに）
+    # 課区・税区列が検出できた場合かつ税抜き法人の場合に税抜き計算を適用する（主列・逆列ともに）
     raw_amounts = pd.to_numeric(raw.iloc[:, amount_col_idx], errors="coerce").fillna(0)
     raw_opp_amounts = pd.to_numeric(raw.iloc[:, opposite_col_idx], errors="coerce").fillna(0)
-    if col_kaku_ku_idx is not None and col_zei_ku_idx is not None:
+    if apply_tax_exclusion and col_kaku_ku_idx is not None and col_zei_ku_idx is not None:
         kaku_ku_col = raw.iloc[:, col_kaku_ku_idx].fillna("").astype(str).str.strip()
         zei_ku_col  = raw.iloc[:, col_zei_ku_idx].fillna("").astype(str).str.strip()
         amount_col_data = pd.Series(
@@ -338,7 +347,7 @@ def load_jdl_excel(
 
     df = df.drop(columns=["_desc"]).reset_index(drop=True)
 
-    return df, raw
+    return df, raw, apply_tax_exclusion
 
 
 
@@ -350,21 +359,22 @@ def load_csv_file(
     amount_label: str,
     taxable_kaku_codes: set[str],
     group_map: dict[str, str] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, float | None, float | None, float]:
+) -> tuple[pd.DataFrame, pd.DataFrame, float | None, float | None, float, bool]:
     """
-    会計CSVファイル（Shift-JIS）を読み込み、以下の5値を返す。
-      df                : 整形済みDataFrame（税抜き純額）
-      raw               : 生データDataFrame
+    会計CSVファイル（Shift-JIS）を読み込み、以下の6値を返す。
+      df                   : 整形済みDataFrame
+      raw                  : 生データDataFrame
       ledger_final_balance : 「元帳終了」直前の残高列最終値（雑収入モード向け）
-      ledger_total_row  : 「合計金額」行の主列値（地代家賃モード向け）
-      taxinc_net_total  : 集計行の税込み純額の合計（地代家賃モード残高チェック用）
+      ledger_total_row     : 「合計金額」行の主列値（地代家賃モード向け）
+      taxinc_net_total     : 集計行の税込み純額の合計（地代家賃モード残高チェック用）
+      apply_tax_exclusion  : 税抜き計算を適用するか（消費税額振替の行が決算月に存在する場合 True）
 
     集計ロジック（1列目が CSV_ROW_MARKER の行を対象）：
     ・スキップ行（SKIP_KEYWORDS に該当）→ 除外
     ・前期計上分戻入 → 逆列金額をマイナスとして計上
     ・当期計上分     → 主列金額をプラスとして計上
     ・通常行         → 主列 − 逆列 の純額を計上
-    ・いずれも税抜き計算を適用する
+    ・apply_tax_exclusion=True（税抜き法人）の場合のみ課区・税区に基づく税抜き計算を適用する
     """
     content = uploaded.read()
     text = content.decode('shift_jis', errors='replace')
@@ -443,8 +453,33 @@ def load_csv_file(
         dtype=str,
     )
 
+    # ── 税抜き計算フラグの決定 ──
+    # 決算月（2列目の月が12より大きい）の行に「消費税額振替」があれば税抜き法人
+    apply_tax_exclusion: bool = False
+    if col_desc_idx is not None:
+        for _row in filtered_rows:
+            _desc_cell = re.sub(r"\s+", "", hankaku_to_zenkaku(
+                _row[col_desc_idx].strip() if col_desc_idx < len(_row) else ""
+            ))
+            if "消費税額振替" not in _desc_cell:
+                continue
+            # 決算月判定：2列目（日付）の月が12より大きい
+            _is_kessan = False
+            if len(_row) > 1:
+                _parts = _row[1].strip().split('/')
+                try:
+                    _month = (int(_parts[1]) if len(_parts) >= 3
+                              else int(_parts[0]) if len(_parts) == 2
+                              else -1)
+                    _is_kessan = _month > 12
+                except (ValueError, IndexError):
+                    pass
+            if _is_kessan:
+                apply_tax_exclusion = True
+                break
+
     if not filtered_rows:
-        return pd.DataFrame(), raw, ledger_final_balance, ledger_total_row, 0.0
+        return pd.DataFrame(), raw, ledger_final_balance, ledger_total_row, 0.0, apply_tax_exclusion
 
     if col_desc_idx is None:
         raise ValueError(
@@ -489,9 +524,13 @@ def load_csv_file(
         main_raw = _cell_float(row, col_amount_idx)
         opp_raw  = _cell_float(row, col_opposite_idx)
 
-        # 税抜き金額（集計用）
-        main_amount = calc_tax_excluded(main_raw, kaku, zei, taxable_kaku_codes)
-        opp_amount  = calc_tax_excluded(opp_raw,  kaku, zei, taxable_kaku_codes)
+        # 税抜き金額（集計用）：税抜き法人のみ課区・税区に基づいて税抜き計算を適用する
+        if apply_tax_exclusion:
+            main_amount = calc_tax_excluded(main_raw, kaku, zei, taxable_kaku_codes)
+            opp_amount  = calc_tax_excluded(opp_raw,  kaku, zei, taxable_kaku_codes)
+        else:
+            main_amount = main_raw
+            opp_amount  = opp_raw
 
         # 金額区分（税抜き純額 / 税込み純額 を並行計算）
         if "前期計上分戻入" in desc_ns:
@@ -546,7 +585,7 @@ def load_csv_file(
     )
     df = df.reset_index(drop=True)
 
-    return df, raw, ledger_final_balance, ledger_total_row, taxinc_net_total
+    return df, raw, ledger_final_balance, ledger_total_row, taxinc_net_total, apply_tax_exclusion
 
 
 def auto_merge_by_frequency(
@@ -807,9 +846,10 @@ def main():
     is_csv = uploaded.name.lower().endswith(".csv")
     ledger_total: float | None = None
     _taxinc_net_total: float = 0.0
+    apply_tax_exclusion: bool = False
     try:
         if is_csv:
-            raw_df, raw_all, _final_balance, _total_row, _taxinc_net_total = load_csv_file(
+            raw_df, raw_all, _final_balance, _total_row, _taxinc_net_total, apply_tax_exclusion = load_csv_file(
                 uploaded, csv_amount_col_name, csv_opposite_col_name,
                 key_col, amount_col, taxable_kaku_codes, group_map
             )
@@ -819,7 +859,7 @@ def main():
             else:
                 ledger_total = _final_balance  # 残高列の最終値
         else:
-            raw_df, raw_all = load_jdl_excel(
+            raw_df, raw_all, apply_tax_exclusion = load_jdl_excel(
                 uploaded, amount_col_idx, opposite_col_idx,
                 key_col, amount_col, taxable_kaku_codes, group_map,
                 skiprows=int(skiprows)
@@ -838,6 +878,12 @@ def main():
         with st.expander("読み込んだ全データ（生）を確認する"):
             st.dataframe(raw_all, use_container_width=True)
         st.stop()
+
+    # 税抜き / 税込み判定結果の表示
+    if apply_tax_exclusion:
+        st.info("💹 **税抜き法人**として集計します（消費税額振替の仕訳を検出 → 税抜き計算を適用）")
+    else:
+        st.info("💹 **税込み法人**として集計します（消費税額振替の仕訳なし → 金額をそのまま使用）")
 
     with st.expander("読み込んだ生データを確認する（抽出後）", expanded=False):
         sep_desc = "全角スペース（\u3000）" if is_csv else "スペース2つ以上"
