@@ -112,6 +112,12 @@ MODES = {
 SIMILARITY_THRESHOLD = 0.80  # 表記ゆれとみなす類似度の閾値
 CONTENT_COL = "取引内容"    # 摘要の2番目の部分（支払先ごとの代表内容）
 
+# 取引内容の表記ゆれ統一マップ（variant → canonical）
+# ここに登録された取引内容は、支払先が異なっても同一取引として合算集計される
+CONTENT_GROUP_MAP: dict[str, str] = {
+    "令和6年度 障害者雇用特例給付金": "令和6年度障害者雇用特例給付金",
+}
+
 
 # ─────────────────────────────────────────────
 # 文字正規化
@@ -690,14 +696,19 @@ def aggregate(
     name_map: dict[str, str],
     group_by_content: bool = False,
     merge_only_payees: set[str] | None = None,
+    content_group_map: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """
     name_map に従って名称を統一してから金額を集計する。
 
     group_by_content=True の場合は (key_col, CONTENT_COL) の組み合わせで集計し、
     収入先ごとに取引内容が異なれば別行として出力する。
-    ただし merge_only_payees に含まれる収入先は key_col のみで集計する
-    （GROUP_MAP で統合済みの名称など、取引内容を問わずまとめたい収入先向け）。
+    ただし以下の優先順位で別処理を行う：
+      ① content_group_map の canonical 値に一致する取引内容を持つ行
+           → CONTENT_COL のみで合算（支払先をまたぐ集計）。
+             代表支払先 = 絶対値が最大の行の支払先名。
+      ② merge_only_payees に含まれる収入先 → key_col のみで集計
+      ③ それ以外 → (key_col, CONTENT_COL) の組み合わせで集計
 
     group_by_content=False（デフォルト）の場合は key_col のみで集計し、
     CONTENT_COL が存在する場合はグループ内の最頻値を代表内容として付加する。
@@ -707,26 +718,44 @@ def aggregate(
 
     has_content = CONTENT_COL in df.columns
 
+    # CONTENT_GROUP_MAP の正規化（取引内容の表記ゆれを統一）
+    _content_gmap = content_group_map or {}
+    content_group_set: set[str] = set(_content_gmap.values())
+    if _content_gmap and has_content:
+        df[CONTENT_COL] = df[CONTENT_COL].map(lambda x: _content_gmap.get(x, x))
+
     def most_frequent(s):
         vc = s[s != ""].value_counts()
         return vc.index[0] if len(vc) > 0 else ""
 
     if group_by_content and has_content:
         _merge_only = merge_only_payees or set()
-        mask_merge = df[key_col].isin(_merge_only)
         parts = []
 
-        # merge_only_payees → key_col のみで集計（取引内容を問わずまとめる）
+        # ① CONTENT_GROUP_MAP 対象行：取引内容のみで合算（支払先をまたぐ）
+        if content_group_set:
+            mask_cgmap = df[CONTENT_COL].isin(content_group_set)
+            if mask_cgmap.any():
+                cg_rows = []
+                for content, grp in df[mask_cgmap].groupby(CONTENT_COL):
+                    total = grp[amount_col].sum()
+                    dominant = grp.loc[grp[amount_col].abs().idxmax(), key_col]
+                    cg_rows.append({key_col: dominant, CONTENT_COL: content, amount_col: total})
+                parts.append(pd.DataFrame(cg_rows))
+                df = df[~mask_cgmap]
+
+        # ② merge_only_payees → key_col のみで集計（取引内容を問わずまとめる）
+        mask_merge = df[key_col].isin(_merge_only)
         if mask_merge.any():
             df_m = df[mask_merge]
             amt = df_m.groupby(key_col, as_index=False)[amount_col].sum()
             cnt = df_m.groupby(key_col, as_index=False)[CONTENT_COL].agg(most_frequent)
             parts.append(amt.merge(cnt, on=key_col)[[key_col, CONTENT_COL, amount_col]])
 
-        # それ以外 → (key_col, CONTENT_COL) の組み合わせで集計
-        if (~mask_merge).any():
-            df_s = df[~mask_merge]
-            agg = df_s.groupby([key_col, CONTENT_COL], as_index=False)[amount_col].sum()
+        # ③ それ以外 → (key_col, CONTENT_COL) の組み合わせで集計
+        remaining = df[~df[key_col].isin(_merge_only)]
+        if not remaining.empty:
+            agg = remaining.groupby([key_col, CONTENT_COL], as_index=False)[amount_col].sum()
             parts.append(agg[[key_col, CONTENT_COL, amount_col]])
 
         result = (
@@ -1044,6 +1073,7 @@ def main():
         working_df, key_col, amount_col, st.session_state.name_map,
         group_by_content=group_by_content,
         merge_only_payees=merge_only_payees,
+        content_group_map=CONTENT_GROUP_MAP if group_by_content else None,
     )
     total_all = result_df[amount_col].sum()
 
