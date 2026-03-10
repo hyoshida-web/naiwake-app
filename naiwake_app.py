@@ -35,8 +35,22 @@ CSV_ROW_MARKER = " #"  # 処理対象行の1列目プレフィックス（会計
 # 摘要列にこれらのキーワードを含む行は金額に関わらずスキップ
 SKIP_KEYWORDS = ["消費税額振替", "月計", "決算月計", "繰越", "期首残高"]
 
-# 年月パターン（例: 2024年7月分）→ parts[n] がこれに一致したら取引内容としてスキップ
-YEARMONTH_RE = re.compile(r'^\d{4}年\d{1,2}月分')
+# 年月パターン（例: 2024年7月分 / 10月分）→ parts[n] がこれに一致したら取引内容としてスキップ
+YEARMONTH_RE = re.compile(r'^(?:\d{4}年)?\d{1,2}月分')
+
+# 取引内容のクリーニング用正規表現
+_CONTENT_YEARMONTH_FULL_RE  = re.compile(r'^(?:\d{4}年)?\d{1,2}月分\s*$')   # 全体が年月のみ
+_CONTENT_YEARMONTH_STRIP_RE = re.compile(r'\d{4}年\d{1,2}月分')              # YYYY年M月分 を除去
+
+
+def _clean_content(content: str) -> str:
+    """取引内容から年月パターンを除去する。
+    - 全体が「YYYY年M月分」または「M月分」→ 空文字を返す
+    - 「YYYY年M月分」を含む場合 → その部分を除去して返す
+    """
+    if _CONTENT_YEARMONTH_FULL_RE.match(content):
+        return ""
+    return _CONTENT_YEARMONTH_STRIP_RE.sub("", content).strip()
 
 # 前期計上分戻入 / 当期計上分 の判定キーワード（摘要の parts[0] に対して照合）
 _MAE_MODOSHI_KWS = frozenset({"前期計上分戻入", "前期分戻入", "前期末未収金戻入"})
@@ -332,7 +346,7 @@ def load_jdl_excel(
         content_idx = payee_idx + 1
         if content_idx < len(parts) and YEARMONTH_RE.match(parts[content_idx].strip()):
             content_idx += 1
-        content = normalize_text(parts[content_idx].strip()) if content_idx < len(parts) else ""
+        content = _clean_content(normalize_text(parts[content_idx].strip()) if content_idx < len(parts) else "")
         payee = _group_map.get(payee, payee)
         return payee, content
 
@@ -603,7 +617,7 @@ def load_csv_file(
             content_idx = payee_idx + 1
             if content_idx < len(parts) and YEARMONTH_RE.match(parts[content_idx].strip()):
                 content_idx += 1
-            content = normalize_text(parts[content_idx].strip()) if content_idx < len(parts) else ""
+            content = _clean_content(normalize_text(parts[content_idx].strip()) if content_idx < len(parts) else "")
             payee   = _group_map.get(payee, payee)
 
         if not payee or payee in ("nan", "NaN"):
