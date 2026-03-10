@@ -50,6 +50,7 @@ MODES = {
             "半場新一": "半場進一",              # 誤字修正
             "加藤":   "加藤純",                  # 名前の省略形を正式名称に統一
         },
+        "group_by_content": False,             # 支払先名のみで集計
         # 消費税振替後の残高は使えないため「合計金額」行の借方合計を正解値として使用する
         # 税込み集計合計との比較なので端数誤差は小さく ±1,000 で判定する
         "ledger_check": "total_row",
@@ -68,6 +69,7 @@ MODES = {
         "group_map": {                          # 収入先名の強制統合マップ
             "東洋リネンサプライ": "東洋リネン",
         },
+        "group_by_content": True,              # 収入先名＋取引内容の組み合わせで集計
         # 残高列の最終値（元帳終了直前）を正解値として使用する
         "ledger_check": "final_balance",
         "ledger_tolerance": 1_000,
@@ -592,31 +594,72 @@ def collapse_to_top_n(df: pd.DataFrame, key_col: str, amount_col: str, top_n: in
     return pd.concat([top, other_row])
 
 
-def aggregate(df: pd.DataFrame, key_col: str, amount_col: str, name_map: dict[str, str]) -> pd.DataFrame:
+def aggregate(
+    df: pd.DataFrame,
+    key_col: str,
+    amount_col: str,
+    name_map: dict[str, str],
+    group_by_content: bool = False,
+    merge_only_payees: set[str] | None = None,
+) -> pd.DataFrame:
     """
     name_map に従って名称を統一してから金額を集計する。
+
+    group_by_content=True の場合は (key_col, CONTENT_COL) の組み合わせで集計し、
+    収入先ごとに取引内容が異なれば別行として出力する。
+    ただし merge_only_payees に含まれる収入先は key_col のみで集計する
+    （GROUP_MAP で統合済みの名称など、取引内容を問わずまとめたい収入先向け）。
+
+    group_by_content=False（デフォルト）の場合は key_col のみで集計し、
     CONTENT_COL が存在する場合はグループ内の最頻値を代表内容として付加する。
     """
     df = df.copy()
     df[key_col] = df[key_col].map(lambda x: name_map.get(x, x))
 
-    amount_result = (
-        df.groupby(key_col, as_index=False)[amount_col]
-        .sum()
-        .sort_values(amount_col, ascending=False)
-        .reset_index(drop=True)
-    )
+    has_content = CONTENT_COL in df.columns
 
-    if CONTENT_COL in df.columns:
-        def most_frequent(s):
-            vc = s[s != ""].value_counts()
-            return vc.index[0] if len(vc) > 0 else ""
+    def most_frequent(s):
+        vc = s[s != ""].value_counts()
+        return vc.index[0] if len(vc) > 0 else ""
 
-        content_result = df.groupby(key_col, as_index=False)[CONTENT_COL].agg(most_frequent)
-        result = amount_result.merge(content_result, on=key_col)
-        result = result[[key_col, CONTENT_COL, amount_col]]
+    if group_by_content and has_content:
+        _merge_only = merge_only_payees or set()
+        mask_merge = df[key_col].isin(_merge_only)
+        parts = []
+
+        # merge_only_payees → key_col のみで集計（取引内容を問わずまとめる）
+        if mask_merge.any():
+            df_m = df[mask_merge]
+            amt = df_m.groupby(key_col, as_index=False)[amount_col].sum()
+            cnt = df_m.groupby(key_col, as_index=False)[CONTENT_COL].agg(most_frequent)
+            parts.append(amt.merge(cnt, on=key_col)[[key_col, CONTENT_COL, amount_col]])
+
+        # それ以外 → (key_col, CONTENT_COL) の組み合わせで集計
+        if (~mask_merge).any():
+            df_s = df[~mask_merge]
+            agg = df_s.groupby([key_col, CONTENT_COL], as_index=False)[amount_col].sum()
+            parts.append(agg[[key_col, CONTENT_COL, amount_col]])
+
+        result = (
+            pd.concat(parts, ignore_index=True)
+            .sort_values(amount_col, ascending=False)
+            .reset_index(drop=True)
+        ) if parts else pd.DataFrame(columns=[key_col, CONTENT_COL, amount_col])
+
     else:
-        result = amount_result
+        # 従来の動作: key_col のみで集計
+        amount_result = (
+            df.groupby(key_col, as_index=False)[amount_col]
+            .sum()
+            .sort_values(amount_col, ascending=False)
+            .reset_index(drop=True)
+        )
+        if has_content:
+            content_result = df.groupby(key_col, as_index=False)[CONTENT_COL].agg(most_frequent)
+            result = amount_result.merge(content_result, on=key_col)
+            result = result[[key_col, CONTENT_COL, amount_col]]
+        else:
+            result = amount_result
 
     result.index = range(1, len(result) + 1)
     return result
@@ -716,6 +759,7 @@ def main():
     default_top_n            = cfg["default_top_n"]
     taxable_kaku_codes       = cfg["taxable_kaku_codes"]
     group_map                = cfg["group_map"]
+    group_by_content         = cfg.get("group_by_content", False)
     ledger_check             = cfg["ledger_check"]
     ledger_tolerance         = cfg["ledger_tolerance"]
 
@@ -911,8 +955,16 @@ def main():
             help="指定件数を超える分は「その他（N件）」1行にまとめます",
         )
 
+    # group_by_content=True の場合、GROUP_MAP の統合対象（values）と「寮費」は
+    # 取引内容を問わず payee 単位でまとめる
+    merge_only_payees = (set(group_map.values()) | {"寮費"}) if group_by_content else None
+
     # 自動統合済み working_df に手動マッピングをさらに適用して集計
-    result_df = aggregate(working_df, key_col, amount_col, st.session_state.name_map)
+    result_df = aggregate(
+        working_df, key_col, amount_col, st.session_state.name_map,
+        group_by_content=group_by_content,
+        merge_only_payees=merge_only_payees,
+    )
     total_all = result_df[amount_col].sum()
 
     # ── 残高チェック（CSVのみ） ──
