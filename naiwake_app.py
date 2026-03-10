@@ -35,6 +35,23 @@ CSV_ROW_MARKER = " #"  # 処理対象行の1列目プレフィックス（会計
 # 摘要列にこれらのキーワードを含む行は金額に関わらずスキップ
 SKIP_KEYWORDS = ["消費税額振替", "月計", "決算月計", "繰越", "期首残高"]
 
+# 年月パターン（例: 2024年7月分）→ parts[n] がこれに一致したら取引内容としてスキップ
+YEARMONTH_RE = re.compile(r'^\d{4}年\d{1,2}月分')
+
+# 前期計上分戻入 / 当期計上分 の判定キーワード（摘要の parts[0] に対して照合）
+_MAE_MODOSHI_KWS = frozenset({"前期計上分戻入", "前期分戻入", "前期末未収金戻入"})
+_TOUKI_KWS       = frozenset({"当期計上分", "当期分", "前期末未収金", "期末未収金", "期末計上分"})
+
+
+def _is_mae_modoshi(p0_ns: str) -> bool:
+    """parts[0]のスペース除去版が前期計上分戻入系かどうか判定する。"""
+    return any(kw in p0_ns for kw in _MAE_MODOSHI_KWS) or p0_ns.startswith("前期分")
+
+
+def _is_touki(p0_ns: str) -> bool:
+    """parts[0]のスペース除去版が当期計上分系かどうか判定する（戻入系より後に評価すること）。"""
+    return any(kw in p0_ns for kw in _TOUKI_KWS)
+
 MODES = {
     "地代家賃": {
         "title": "地代家賃の内訳",
@@ -304,11 +321,18 @@ def load_jdl_excel(
 
     def extract_payee_and_content(desc: str) -> tuple[str, str]:
         parts = re.split(r"\s{2,}", desc)
-        payee   = normalize_text(parts[0].strip()) if parts else ""
-        content = normalize_text(parts[1].strip()) if len(parts) > 1 else ""
         # 「〇月分給与」など摘要に「給与」を含む行はすべて「寮費」に統合
         if "給与" in desc:
             return "寮費", "寮費"
+        p0_ns = re.sub(r"\s+", "", parts[0]) if parts else ""
+        # 前期計上分戻入・当期計上分系はparts[0]がキーワードなのでparts[1]を支払先とする
+        payee_idx = 1 if (_is_mae_modoshi(p0_ns) or _is_touki(p0_ns)) else 0
+        payee = normalize_text(parts[payee_idx].strip()) if payee_idx < len(parts) else ""
+        # parts[payee_idx+1] が年月パターンなら1つ後ろを取引内容として採用
+        content_idx = payee_idx + 1
+        if content_idx < len(parts) and YEARMONTH_RE.match(parts[content_idx].strip()):
+            content_idx += 1
+        content = normalize_text(parts[content_idx].strip()) if content_idx < len(parts) else ""
         payee = _group_map.get(payee, payee)
         return payee, content
 
@@ -517,6 +541,12 @@ def load_csv_file(
         if re.search(skip_pattern, desc_ns):
             continue
 
+        # 全角スペース区切りで分割し、parts[0] で前期/当期キーワードを判定
+        parts = desc.split('\u3000')
+        p0_ns = re.sub(r"\s+", "", parts[0]) if parts else ""
+        _mae = _is_mae_modoshi(p0_ns)
+        _tou = _is_touki(p0_ns) and not _mae
+
         # 課区・税区
         kaku = row[col_kaku_ku_idx].strip() if col_kaku_ku_idx is not None and col_kaku_ku_idx < len(row) else ""
         zei  = row[col_zei_ku_idx].strip()  if col_zei_ku_idx  is not None and col_zei_ku_idx  < len(row) else ""
@@ -536,11 +566,11 @@ def load_csv_file(
             opp_amount  = opp_raw
 
         # 金額区分（税抜き純額 / 税込み純額 を並行計算）
-        if "前期計上分戻入" in desc_ns:
-            net        = -opp_amount   # 逆列をマイナスで計上
+        if _mae:
+            net        = -opp_amount   # 逆列をマイナスで計上（前期計上分戻入系）
             taxinc_net = -opp_raw
-        elif "当期計上分" in desc_ns:
-            net        = main_amount   # 主列をプラスで計上
+        elif _tou:
+            net        = main_amount   # 主列をプラスで計上（当期計上分系）
             taxinc_net = main_raw
         else:
             net        = main_amount - opp_amount  # 通常行：純額
@@ -562,18 +592,18 @@ def load_csv_file(
         taxinc_net_total += taxinc_net
 
         # 支払先・取引内容を摘要から抽出（全角スペース区切り）
-        # 「前期計上分戻入」「当期計上分」を含む行は parts[0] がキーワード自身のため
-        # parts[1] を支払先、parts[2] を取引内容として使用する
-        parts = desc.split('\u3000')
+        # parts はループ冒頭で既に計算済み
         if "給与" in desc:
             payee, content = "寮費", "寮費"
-        elif "前期計上分戻入" in desc_ns or "当期計上分" in desc_ns:
-            payee   = normalize_text(parts[1].strip()) if len(parts) > 1 else ""
-            content = normalize_text(parts[2].strip()) if len(parts) > 2 else ""
-            payee   = _group_map.get(payee, payee)
         else:
-            payee   = normalize_text(parts[0].strip()) if parts else ""
-            content = normalize_text(parts[1].strip()) if len(parts) > 1 else ""
+            # 前期/当期キーワード行は parts[0]=キーワードなので parts[1] を支払先とする
+            payee_idx   = 1 if (_mae or _tou) else 0
+            payee       = normalize_text(parts[payee_idx].strip()) if payee_idx < len(parts) else ""
+            # parts[payee_idx+1] が年月パターンなら1つ後ろを取引内容として採用
+            content_idx = payee_idx + 1
+            if content_idx < len(parts) and YEARMONTH_RE.match(parts[content_idx].strip()):
+                content_idx += 1
+            content = normalize_text(parts[content_idx].strip()) if content_idx < len(parts) else ""
             payee   = _group_map.get(payee, payee)
 
         if not payee or payee in ("nan", "NaN"):
