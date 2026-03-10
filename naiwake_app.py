@@ -239,9 +239,9 @@ def load_jdl_excel(
     taxable_kaku_codes: set[str],
     group_map: dict[str, str] | None = None,
     skiprows: int = 0,
-) -> tuple[pd.DataFrame, pd.DataFrame, bool]:
+) -> tuple[pd.DataFrame, pd.DataFrame, bool, float | None]:
     """
-    JDL元帳Excelを列位置で読み込み、整形済みDataFrameと生データと税抜きフラグを返す。
+    JDL元帳Excelを列位置で読み込み、整形済みDataFrameと生データと税抜きフラグと最終残高を返す。
     - 全シートを読み込んで結合（複数月シート対応）
     - 各シートのヘッダー行（1列目が「年月日」の行）から課区・税区列を検出
     - 摘要列（COL_DESC）をスペース2つ以上で分割し、先頭部分を支払先/収入先名とする
@@ -263,9 +263,10 @@ def load_jdl_excel(
     # 各シートの列ヘッダー行を検出：1列目が「年月日」を含む行
     header_mask = raw.iloc[:, 0].fillna("").astype(str).str.contains("年月日", na=False)
 
-    # ヘッダー行から課区・税区の列インデックスを動的に取得
+    # ヘッダー行から課区・税区・残高の列インデックスを動的に取得
     col_kaku_ku_idx: int | None = None
     col_zei_ku_idx: int | None = None
+    col_balance_idx: int | None = None
     header_rows = raw[header_mask]
     if not header_rows.empty:
         hrow = header_rows.iloc[0]
@@ -275,9 +276,19 @@ def load_jdl_excel(
                 col_kaku_ku_idx = i
             elif c == "税区":
                 col_zei_ku_idx = i
+            elif c == "残高":
+                col_balance_idx = i
 
     # ヘッダー行を除去
     raw = raw[~header_mask].reset_index(drop=True)
+
+    # 残高列の最終値を取得（元帳終了直前の残高）
+    ledger_final_balance: float | None = None
+    if col_balance_idx is not None and col_balance_idx < raw.shape[1]:
+        balance_series = pd.to_numeric(raw.iloc[:, col_balance_idx], errors="coerce")
+        valid_balances = balance_series.dropna()
+        if not valid_balances.empty:
+            ledger_final_balance = float(valid_balances.iloc[-1])
 
     # 税抜き計算フラグの決定
     # 全シートの摘要列をスキャンし「消費税額振替」の行があれば税抜き法人
@@ -349,7 +360,7 @@ def load_jdl_excel(
 
     df = df.drop(columns=["_desc"]).reset_index(drop=True)
 
-    return df, raw, apply_tax_exclusion
+    return df, raw, apply_tax_exclusion, ledger_final_balance
 
 
 
@@ -844,17 +855,14 @@ def main():
                 uploaded, csv_amount_col_name, csv_opposite_col_name,
                 key_col, amount_col, taxable_kaku_codes, group_map
             )
-            # 税抜き/税込みに応じて残高チェックの正解値を選択
-            if apply_tax_exclusion:
-                ledger_total = _total_row      # 税抜き法人：合計金額行の主列合計（借方 or 貸方）
-            else:
-                ledger_total = _final_balance  # 税込み法人：最終残高
+            ledger_total = _final_balance  # 残高列の最終値を正解値として使用
         else:
-            raw_df, raw_all, apply_tax_exclusion = load_jdl_excel(
+            raw_df, raw_all, apply_tax_exclusion, _final_balance = load_jdl_excel(
                 uploaded, amount_col_idx, opposite_col_idx,
                 key_col, amount_col, taxable_kaku_codes, group_map,
                 skiprows=int(skiprows)
             )
+            ledger_total = _final_balance  # 残高列の最終値を正解値として使用
     except Exception as e:
         st.error(f"ファイルの読み込みに失敗しました: {e}")
         st.stop()
@@ -1052,11 +1060,10 @@ def main():
             help="指定件数を超える分は「その他（N件）」1行にまとめます",
         )
 
-    # ── 残高チェック（CSVのみ） ──
-    if is_csv and ledger_total is not None:
-        # 税抜き法人：税込み純額合計 vs 合計金額行の主列合計（借方 or 貸方）
-        # 税込み法人：税抜き集計合計（＝税込み金額そのまま） vs 最終残高
-        check_total = _taxinc_net_total if apply_tax_exclusion else total_all
+    # ── 残高チェック（CSV・Excel共通） ──
+    if ledger_total is not None:
+        # 税込み・税抜きに関わらず集計合計 vs 残高列の最終値で照合
+        check_total = total_all
         diff = check_total - ledger_total
         if abs(diff) <= ledger_tolerance:
             st.success(f"✅ 元帳とほぼ一致しています（誤差：{diff:+,.0f}円）")
