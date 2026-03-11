@@ -357,24 +357,22 @@ def load_jdl_excel(
                 raw_payee   = _group_map.get(raw_payee, raw_payee)
                 return raw_payee, raw_content
 
-        # 前期計上分戻入・当期計上分系はparts[0]がキーワードなのでparts[1]を支払先とする
+        # 前期計上分戻入・当期計上分系の判定
         p1_ns = re.sub(r"\s+", "", parts[1]) if len(parts) > 1 else ""
         if _is_mae_modoshi(p0_ns) or _is_touki(p0_ns):
             payee_idx = 1
         elif _is_mae_modoshi(p1_ns):
+            # 「取引内容　前期計上分戻入　支払先」パターン
             payee_idx = 2
         else:
             payee_idx = 0
+
         payee = normalize_text(parts[payee_idx].strip()) if payee_idx < len(parts) else ""
-        # payee_idx==2 の場合は parts[0] が取引内容
-        if payee_idx == 2:
-            content = _clean_content(normalize_text(parts[0].strip()))
-        else:
-            # parts[payee_idx+1] が年月パターンなら1つ後ろを取引内容として採用
-            content_idx = payee_idx + 1
-            if content_idx < len(parts) and YEARMONTH_RE.match(parts[content_idx].strip()):
-                content_idx += 1
-            content = _clean_content(normalize_text(parts[content_idx].strip()) if content_idx < len(parts) else "")
+        # parts[payee_idx+1] が年月パターンなら1つ後ろを取引内容として採用
+        content_idx = payee_idx + 1
+        if content_idx < len(parts) and YEARMONTH_RE.match(parts[content_idx].strip()):
+            content_idx += 1
+        content = _clean_content(normalize_text(parts[content_idx].strip()) if content_idx < len(parts) else "")
         payee = _group_map.get(payee, payee)
         return payee, content
 
