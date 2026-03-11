@@ -357,17 +357,33 @@ def load_jdl_excel(
                 raw_payee   = _group_map.get(raw_payee, raw_payee)
                 return raw_payee, raw_content
 
-        # 前期計上分戻入・当期計上分系の判定
-        p1_ns = re.sub(r"\s+", "", parts[1]) if len(parts) > 1 else ""
-        if _is_mae_modoshi(p0_ns) or _is_touki(p0_ns):
-            payee_idx = 1
-        elif _is_mae_modoshi(p1_ns):
-            # 「取引内容　前期計上分戻入　支払先」パターン
-            payee_idx = 2
+        # 前期計上分戻入・当期計上分キーワードがどの位置にあるか探す
+        modoshi_idx = None
+        touki_idx = None
+        for _i, _p in enumerate(parts):
+            _ns = re.sub(r"\s+", "", _p)
+            if _is_mae_modoshi(_ns):
+                modoshi_idx = _i
+                break
+            if _is_touki(_ns) and touki_idx is None:
+                touki_idx = _i
+
+        if modoshi_idx is not None:
+            # キーワードより前のpartsを取引内容、後を支払先とする
+            payee_idx   = modoshi_idx + 1 if modoshi_idx + 1 < len(parts) else modoshi_idx - 1
+            content_idx_override = next((i for i in range(modoshi_idx) if i != payee_idx), None)
+        elif touki_idx is not None:
+            payee_idx   = touki_idx + 1 if touki_idx + 1 < len(parts) else touki_idx - 1
+            content_idx_override = next((i for i in range(touki_idx) if i != payee_idx), None)
         else:
             payee_idx = 0
+            content_idx_override = None
 
         payee = normalize_text(parts[payee_idx].strip()) if payee_idx < len(parts) else ""
+        if content_idx_override is not None:
+            content = _clean_content(normalize_text(parts[content_idx_override].strip()))
+            payee = _group_map.get(payee, payee)
+            return payee, content
         # parts[payee_idx+1] が年月パターンなら1つ後ろを取引内容として採用
         content_idx = payee_idx + 1
         if content_idx < len(parts) and YEARMONTH_RE.match(parts[content_idx].strip()):
