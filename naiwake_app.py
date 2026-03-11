@@ -602,14 +602,20 @@ def load_csv_file(
         if re.search(skip_pattern, desc_ns):
             continue
 
-        # 全角スペース区切りで分割し、前期/当期キーワードを判定
-        # parts[0] が通常のキーワード位置（パターンA）、parts[1] がキーワードのパターンB も対応
-        parts = desc.split('\u3000')
-        p0_ns = re.sub(r"\s+", "", parts[0]) if parts else ""
-        p1_ns = re.sub(r"\s+", "", parts[1]) if len(parts) > 1 else ""
-        _mae_p1 = _is_mae_modoshi(p1_ns)           # 「取引内容　前期計上分戻入　支払先」パターン
-        _mae    = _is_mae_modoshi(p0_ns) or _mae_p1
-        _tou    = _is_touki(p0_ns) and not _mae
+        parts = [p for p in desc.split('\u3000') if p.strip()]
+        _mae = False
+        _tou = False
+        _kw_idx = None
+        for _i, _p in enumerate(parts):
+            _ns = re.sub(r"\s+", "", _p)
+            if _is_mae_modoshi(_ns):
+                _mae = True
+                _kw_idx = _i
+                break
+            if _is_touki(_ns):
+                _tou = True
+                _kw_idx = _i
+                break
 
         # 課区・税区
         kaku = row[col_kaku_ku_idx].strip() if col_kaku_ku_idx is not None and col_kaku_ku_idx < len(row) else ""
@@ -659,13 +665,15 @@ def load_csv_file(
         # parts はループ冒頭で既に計算済み
         if "給与" in desc:
             payee, content = "寮費", "寮費"
-        elif _mae_p1:
-            # 「取引内容　前期計上分戻入　支払先」パターン（parts[1]がキーワード）
-            content = _clean_content(normalize_text(parts[0].strip()))
-            payee   = normalize_text(parts[2].strip()) if len(parts) > 2 else ""
+        elif (_mae or _tou) and _kw_idx is not None and _kw_idx > 0:
+            # キーワードが先頭以外 → キーワード前が取引内容、後が支払先
+            payee_idx = _kw_idx + 1 if _kw_idx + 1 < len(parts) else _kw_idx - 1
+            content_src = next((i for i in range(_kw_idx) if i != payee_idx), 0)
+            content = _clean_content(normalize_text(parts[content_src].strip()))
+            payee   = normalize_text(parts[payee_idx].strip()) if payee_idx < len(parts) else ""
             payee   = _group_map.get(payee, payee)
         else:
-            # 前期/当期キーワード行は parts[0]=キーワードなので parts[1] を支払先とする
+            # キーワードが先頭（または通常行）→ parts[1] を支払先とする
             payee_idx   = 1 if (_mae or _tou) else 0
             payee       = normalize_text(parts[payee_idx].strip()) if payee_idx < len(parts) else ""
             # parts[payee_idx+1] が年月パターンなら1つ後ろを取引内容として採用
