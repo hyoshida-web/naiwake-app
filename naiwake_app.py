@@ -345,23 +345,23 @@ def load_jdl_excel(
         # 「〇月分給与」など摘要に「給与」を含む行はすべて「寮費」に統合
         if "給与" in desc:
             return "寮費", "寮費"
-        # スペース区切りなし かつ 全角括弧（〇〇）を含む
-        # → 括弧内を支払先、括弧より前（先頭のN月分を除去）を取引内容とする
-        # 例: 「3月分クリーニング取扱手数料（東洋リネンサプライ）」
-        if len(parts) == 1:
-            _m = re.search(r'（([^）]+)）', parts[0])
-            if _m and parts[0][:_m.start()].strip():
-                payee = normalize_text(_m.group(1).strip())
-                content_raw = re.sub(r'^(?:\d{4}年)?\d{1,2}月分', '', parts[0][:_m.start()].strip()).strip()
-                content = _clean_content(normalize_text(content_raw))
-                payee = _group_map.get(payee, payee)
-                return payee, content
         p0_ns = re.sub(r"\s+", "", parts[0]) if parts else ""
+
+        # 「N月分取引内容（支払先）」または「取引内容（支払先）」パターンの処理
+        # 全角スペースなし かつ 末尾が全角括弧「（〇〇）」の場合
+        if len(parts) == 1:
+            m = re.match(r'^(?:\d+月分)?(.*?)（(.+?)）.*', parts[0])
+            if m:
+                raw_content = _clean_content(normalize_text(m.group(1).strip()))
+                raw_payee   = normalize_text(m.group(2).strip())
+                raw_payee   = _group_map.get(raw_payee, raw_payee)
+                return raw_payee, raw_content
+
+        # 前期計上分戻入・当期計上分系はparts[0]がキーワードなのでparts[1]を支払先とする
         p1_ns = re.sub(r"\s+", "", parts[1]) if len(parts) > 1 else ""
         if _is_mae_modoshi(p0_ns) or _is_touki(p0_ns):
             payee_idx = 1
         elif _is_mae_modoshi(p1_ns):
-            # 「取引内容　前期計上分戻入　支払先」パターン
             payee_idx = 2
         else:
             payee_idx = 0
