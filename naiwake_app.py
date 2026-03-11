@@ -53,7 +53,7 @@ def _clean_content(content: str) -> str:
     return _CONTENT_YEARMONTH_STRIP_RE.sub("", content).strip()
 
 # 前期計上分戻入 / 当期計上分 の判定キーワード（摘要の parts[0] に対して照合）
-_MAE_MODOSHI_KWS = frozenset({"前期計上分戻入", "前期分戻入", "前期末未収金戻入"})
+_MAE_MODOSHI_KWS = frozenset({"前期計上分戻入", "前期計上戻入", "前期分戻入", "前期末未収金戻入"})
 _TOUKI_KWS       = frozenset({"当期計上分", "当期分", "前期末未収金", "期末未収金", "期末計上分"})
 
 
@@ -346,6 +346,13 @@ def load_jdl_excel(
         if "給与" in desc:
             return "寮費", "寮費"
         p0_ns = re.sub(r"\s+", "", parts[0]) if parts else ""
+        p1_ns = re.sub(r"\s+", "", parts[1]) if len(parts) > 1 else ""
+        # 「取引内容　前期計上分戻入　支払先」パターン（parts[1]がキーワード）
+        if _is_mae_modoshi(p1_ns):
+            content = _clean_content(normalize_text(parts[0].strip()))
+            payee   = normalize_text(parts[2].strip()) if len(parts) > 2 else ""
+            payee   = _group_map.get(payee, payee)
+            return payee, content
         # 前期計上分戻入・当期計上分系はparts[0]がキーワードなのでparts[1]を支払先とする
         payee_idx = 1 if (_is_mae_modoshi(p0_ns) or _is_touki(p0_ns)) else 0
         payee = normalize_text(parts[payee_idx].strip()) if payee_idx < len(parts) else ""
@@ -562,11 +569,14 @@ def load_csv_file(
         if re.search(skip_pattern, desc_ns):
             continue
 
-        # 全角スペース区切りで分割し、parts[0] で前期/当期キーワードを判定
+        # 全角スペース区切りで分割し、前期/当期キーワードを判定
+        # parts[0] が通常のキーワード位置（パターンA）、parts[1] がキーワードのパターンB も対応
         parts = desc.split('\u3000')
         p0_ns = re.sub(r"\s+", "", parts[0]) if parts else ""
-        _mae = _is_mae_modoshi(p0_ns)
-        _tou = _is_touki(p0_ns) and not _mae
+        p1_ns = re.sub(r"\s+", "", parts[1]) if len(parts) > 1 else ""
+        _mae_p1 = _is_mae_modoshi(p1_ns)           # 「取引内容　前期計上分戻入　支払先」パターン
+        _mae    = _is_mae_modoshi(p0_ns) or _mae_p1
+        _tou    = _is_touki(p0_ns) and not _mae
 
         # 課区・税区
         kaku = row[col_kaku_ku_idx].strip() if col_kaku_ku_idx is not None and col_kaku_ku_idx < len(row) else ""
@@ -616,6 +626,11 @@ def load_csv_file(
         # parts はループ冒頭で既に計算済み
         if "給与" in desc:
             payee, content = "寮費", "寮費"
+        elif _mae_p1:
+            # 「取引内容　前期計上分戻入　支払先」パターン（parts[1]がキーワード）
+            content = _clean_content(normalize_text(parts[0].strip()))
+            payee   = normalize_text(parts[2].strip()) if len(parts) > 2 else ""
+            payee   = _group_map.get(payee, payee)
         else:
             # 前期/当期キーワード行は parts[0]=キーワードなので parts[1] を支払先とする
             payee_idx   = 1 if (_mae or _tou) else 0
