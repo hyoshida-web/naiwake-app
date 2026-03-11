@@ -341,7 +341,7 @@ def load_jdl_excel(
     _group_map = group_map or {}
 
     def extract_payee_and_content(desc: str) -> tuple[str, str]:
-        parts = re.split(r"\s{2,}", desc)
+        parts = [p for p in re.split(r"\u3000+|\s{2,}", desc) if p.strip()]
         # 「〇月分給与」など摘要に「給与」を含む行はすべて「寮費」に統合
         if "給与" in desc:
             return "寮費", "寮費"
@@ -368,22 +368,27 @@ def load_jdl_excel(
             if _is_touki(_ns) and touki_idx is None:
                 touki_idx = _i
 
-        if modoshi_idx is not None:
-            # キーワードより前のpartsを取引内容、後を支払先とする
-            payee_idx   = modoshi_idx + 1 if modoshi_idx + 1 < len(parts) else modoshi_idx - 1
-            content_idx_override = next((i for i in range(modoshi_idx) if i != payee_idx), None)
-        elif touki_idx is not None:
-            payee_idx   = touki_idx + 1 if touki_idx + 1 < len(parts) else touki_idx - 1
-            content_idx_override = next((i for i in range(touki_idx) if i != payee_idx), None)
-        else:
-            payee_idx = 0
-            content_idx_override = None
-
-        payee = normalize_text(parts[payee_idx].strip()) if payee_idx < len(parts) else ""
-        if content_idx_override is not None:
-            content = _clean_content(normalize_text(parts[content_idx_override].strip()))
+        if modoshi_idx is not None or touki_idx is not None:
+            kw_idx = modoshi_idx if modoshi_idx is not None else touki_idx
+            other = [i for i in range(len(parts)) if i != kw_idx]
+            if len(other) >= 2:
+                if kw_idx == 0:
+                    payee_idx_r, content_idx_r = other[0], other[1]
+                else:
+                    content_idx_r, payee_idx_r = other[0], other[-1]
+            elif len(other) == 1:
+                payee_idx_r, content_idx_r = other[0], None
+            else:
+                payee_idx_r, content_idx_r = 0, None
+            payee = normalize_text(parts[payee_idx_r].strip()) if payee_idx_r < len(parts) else ""
             payee = _group_map.get(payee, payee)
+            if content_idx_r is not None:
+                content = _clean_content(normalize_text(parts[content_idx_r].strip()))
+            else:
+                content = ""
             return payee, content
+        payee_idx = 0
+        content_idx_override = None
         # parts[payee_idx+1] が年月パターンなら1つ後ろを取引内容として採用
         content_idx = payee_idx + 1
         if content_idx < len(parts) and YEARMONTH_RE.match(parts[content_idx].strip()):
