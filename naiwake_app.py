@@ -54,7 +54,7 @@ def _clean_content(content: str) -> str:
 
 # 前期計上分戻入 / 当期計上分 の判定キーワード（摘要の parts[0] に対して照合）
 _MAE_MODOSHI_KWS = frozenset({"前期計上分戻入", "前期計上戻入", "前期計上", "前期分戻入", "前期末未収金戻入"})
-_TOUKI_KWS       = frozenset({"当期計上分", "当期分", "前期末未収金", "期末未収金", "期末計上分"})
+_TOUKI_KWS       = frozenset({"当期計上分", "当期計上", "当期分", "前期末未収金", "期末未収金", "期末計上分"})
 
 
 def _is_mae_modoshi(p0_ns: str) -> bool:
@@ -673,8 +673,18 @@ def load_csv_file(
             payee   = normalize_text(parts[payee_idx].strip()) if payee_idx < len(parts) else ""
             payee   = _group_map.get(payee, payee)
         else:
-            # キーワードが先頭（または通常行）→ parts[1] を支払先とする
-            payee_idx   = 1 if (_mae or _tou) else 0
+            # キーワードがどの位置にあるか探して支払先を抽出
+            kw_idx = None
+            for _ki, _kp in enumerate(parts):
+                _kns = re.sub(r"\s+", "", _kp)
+                if _is_mae_modoshi(_kns) or _is_touki(_kns):
+                    kw_idx = _ki
+                    break
+            if kw_idx is not None:
+                other = [i for i in range(len(parts)) if i != kw_idx]
+                payee_idx = other[0] if other else 0
+            else:
+                payee_idx = 0
             payee       = normalize_text(parts[payee_idx].strip()) if payee_idx < len(parts) else ""
             # parts[payee_idx+1] が年月パターンなら1つ後ろを取引内容として採用
             content_idx = payee_idx + 1
