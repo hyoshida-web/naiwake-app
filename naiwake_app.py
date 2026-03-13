@@ -222,6 +222,8 @@ def normalize_text(text):
     # 「東洋リネンサプライ」で始まる文字列は取引内容が混入していても支払先名に統一
     if text.startswith('東洋リネンサプライ'):
         text = '東洋リネンサプライ'
+    # 「◆アメニティ」など文字化けを含むアメニティ表記を統一
+    text = re.sub(r'.?アメニティ', 'アメニティ', text)
     return text
 
 
