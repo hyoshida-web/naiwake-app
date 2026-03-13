@@ -53,7 +53,7 @@ def _clean_content(content: str) -> str:
     return _CONTENT_YEARMONTH_STRIP_RE.sub("", content).strip()
 
 # 前期計上分戻入 / 当期計上分 の判定キーワード（摘要の parts[0] に対して照合）
-_MAE_MODOSHI_KWS = frozenset({"前期計上分戻入", "前期計上戻入", "前期分戻入", "前期末未収金戻入"})
+_MAE_MODOSHI_KWS = frozenset({"前期計上分戻入", "前期計上戻入", "前期計上", "前期分戻入", "前期末未収金戻入"})
 _TOUKI_KWS       = frozenset({"当期計上分", "当期分", "前期末未収金", "期末未収金", "期末計上分"})
 
 
